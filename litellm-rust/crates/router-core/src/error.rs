@@ -12,8 +12,8 @@ pub enum Unsupported {
     Strategy(RoutingStrategy),
     #[error("routing plugin `{0}` needs a host that can select")]
     Plugin(String),
-    #[error("operation `{op}` on provider `{provider}` has no executor")]
-    Executor { op: Op, provider: String },
+    #[error("the host cannot run operation `{op}` on provider `{provider}`")]
+    Op { op: Op, provider: String },
 }
 
 #[derive(Debug, thiserror::Error)]

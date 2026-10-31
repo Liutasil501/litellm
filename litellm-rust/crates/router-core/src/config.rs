@@ -305,8 +305,8 @@ pub struct RouterConfig {
     /// Deployment ids that are a provider's default and never cool down
     /// (`provider_default_deployment_ids`).
     pub provider_default_deployment_ids: Vec<String>,
-    /// The operations this router must serve; with a host that cannot invoke, each must have a
-    /// native executor for every configured provider or the router fails to build.
+    /// The operations this router must serve: `Host::supports` must accept each one for every
+    /// configured provider, or the router fails to build.
     pub served_ops: Vec<Op>,
 }
 

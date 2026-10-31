@@ -324,6 +324,9 @@ class ScriptedHost(PythonHost):
 
         return done()
 
+    def sleep_sync(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
     def dynamic(self) -> RouterDynamicConfig:
         return self._dynamic
 

@@ -8,12 +8,16 @@ mod host;
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
-use litellm_router_core::{AttemptError, Error, FailureKind, Op, Router, RouterEvent};
+use litellm_router_core::{
+    AttemptError, Error, FailureKind, Op, Outcome, Router, RouterEvent,
+    health::{UsageMetric, current_minute, usage_key},
+    registry::{DeploymentFilter, ResolveScope},
+};
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
@@ -132,7 +136,8 @@ impl RouterCoreHandle {
         }))
     }
 
-    /// Apply `{"upsert": [deployments], "delete": [ids]}` and return the new registry version.
+    /// Apply `{"upsert": [deployments], "delete": [ids], "settings": {dynamic document}}` and
+    /// return the new registry version.
     fn apply(&self, changes: &Bound<'_, PyAny>) -> PyResult<u64> {
         let changes = config::changes(document(changes)?).map_err(config_error_to_pyerr)?;
         self.router
@@ -142,6 +147,90 @@ impl RouterCoreHandle {
 
     fn registry_version(&self) -> u64 {
         self.router.registry().version()
+    }
+
+    /// Record a failure the router did not see itself (a health check, an interceptor), driven
+    /// like `start`: its steps are cache ops, and it ends with `done` (`cooled`).
+    fn report_failure(&self, id: &str, failure: &Bound<'_, PyDict>) -> PyResult<RouterCall> {
+        let failure = match attempt_outcome(failure)? {
+            Err(failure) => failure,
+            Ok(_) => return Err(PyValueError::new_err("a reported failure needs `ok: False`")),
+        };
+        let router = self.router.clone();
+        let id = id.to_owned();
+        Ok(RouterCall::new(async move {
+            router
+                .report(&id, Outcome::Failure(failure))
+                .await
+                .map(|cooled| Finish::Reported { cooled })
+        }))
+    }
+
+    /// This worker's (successes, failures) against a deployment this minute.
+    fn outcomes_this_minute(&self, id: &str) -> (u64, u64) {
+        self.router.health().outcomes_this_minute(id)
+    }
+
+    /// The usage keys of this minute for every deployment of `model_group`:
+    /// `[(id, tpm_key, rpm_key)]`, or None when the group has no deployment.
+    fn usage_keys(&self, model_group: &str) -> Option<Vec<(String, String, String)>> {
+        let minute = current_minute(SystemTime::now());
+        let group = self.router.registry().group(model_group)?;
+        Some(
+            group
+                .iter()
+                .map(|deployment| {
+                    let model = &deployment.params.model;
+                    (
+                        deployment.id.clone(),
+                        usage_key(&deployment.id, model, UsageMetric::Tpm, &minute),
+                        usage_key(&deployment.id, model, UsageMetric::Rpm, &minute),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Every configured deployment, as `model_list` entries with their ids, in config order.
+    fn deployments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let registry = self.router.registry();
+        let records = registry
+            .deployments(&DeploymentFilter::default())
+            .iter()
+            .map(|deployment| to_py(py, &host::deployment_record(deployment)))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, records)
+    }
+
+    /// The deployment with this id, or None.
+    fn deployment(&self, py: Python<'_>, id: &str) -> PyResult<Option<Py<PyAny>>> {
+        self.router
+            .registry()
+            .deployment(id)
+            .map(|deployment| to_py(py, &host::deployment_record(&deployment)))
+            .transpose()
+    }
+
+    /// What `name` resolves to: `{"model_group", "kind", "ids"}`, or None for an unknown name.
+    #[pyo3(signature = (name, specific_deployment=false))]
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        specific_deployment: bool,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let registry = self.router.registry();
+        let Some(resolution) = registry.resolve(name, ResolveScope { specific_deployment }) else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("model_group", resolution.group)?;
+        dict.set_item("kind", format!("{:?}", resolution.kind))?;
+        dict.set_item(
+            "ids",
+            PyList::new(py, resolution.deployments.iter().map(|d| d.id.clone()))?,
+        )?;
+        Ok(Some(dict))
     }
 
     fn retire(&self) {
@@ -346,6 +435,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
     match ask {
         Ask::Attempt {
             deployment_id,
+            deployment,
             model,
             model_group,
             target_order,
@@ -356,6 +446,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             timeout,
         } => {
             dict.set_item("deployment_id", deployment_id)?;
+            dict.set_item("deployment", to_py(py, &deployment)?)?;
             dict.set_item("model", model)?;
             dict.set_item("model_group", model_group)?;
             dict.set_item("target_order", target_order)?;
@@ -414,6 +505,7 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
             dict.set_item("deployment_id", deployment_id)?;
             dict.set_item("model_group", model_group)
         }
+        Finish::Reported { cooled } => dict.set_item("cooled", cooled),
     }
 }
 
@@ -486,10 +578,17 @@ kinds = [step["kind"] for step in steps]
 
 cooled = native.RouterCoreHandle(pair, {"num_retries": 0})
 call = cooled.start("acompletion", {"model": "primary"})
-tried = drive(call, None)["deployment_id"]
+attempt = drive(call, None)
+tried = attempt["deployment_id"]
+assert attempt["deployment"]["model_info"]["id"] == tried, attempt
+assert attempt["deployment"]["litellm_params"]["model"].startswith("openai/"), attempt
+assert [d["model_info"]["id"] for d in cooled.deployments()] == ["a1", "a2"]
+assert cooled.deployment("a2")["model_name"] == "primary"
+assert cooled.resolve("primary")["ids"] == ["a1", "a2"]
+assert cooled.resolve("nope") is None
 assert drive(call, {"ok": False, "kind": "RateLimitError", "status": 429})["kind"] == "failed"
-assert f"deployment:{tried}:cooldown" not in store, store
-store[f"deployment:{tried}:cooldown"] = {"exception_received": "x", "status_code": "429", "timestamp": time.time(), "cooldown_time": 60.0}
+# The core records the failure itself: the 429 cools the deployment down in the host's store.
+assert f"deployment:{tried}:cooldown" in store, store
 other = drive(cooled.select("primary", {}), None)
 assert other["kind"] == "done" and other["deployment_id"] != tried, other
 

@@ -11,8 +11,7 @@ use tracing::warn;
 use crate::{
     Core, Snapshot,
     config::Op,
-    error::{AttemptError, ConfigError, Error, FailureKind},
-    executor::Executor,
+    error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
     registry::ResolveKind,
@@ -426,7 +425,7 @@ impl Core {
         Duration::from_secs_f64(backoff + jitter)
     }
 
-    /// One attempt: select a deployment, run it on its executor, record the outcome.
+    /// One attempt: select a deployment, run it through the host, record the outcome.
     #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
@@ -452,10 +451,13 @@ impl Core {
             model_group: candidates.model_group.clone(),
             deployment_id: deployment.id.clone(),
         });
-        let executor = self
-            .executors
-            .resolve(op, deployment.provider())
-            .map_err(|unsupported| Error::Config(ConfigError::Unsupported(unsupported)))?;
+        if !self.host.supports(op, deployment.provider()) {
+            return Err(Error::Config(ConfigError::Unsupported(Unsupported::Op {
+                op: op.clone(),
+                provider: deployment.provider().to_owned(),
+            }))
+            .into());
+        }
         let attempt = Attempt {
             op: op.clone(),
             request: request.clone(),
@@ -469,17 +471,10 @@ impl Core {
             fallback_level: at.level,
             timeout: snapshot.settings.timeout,
         };
-        let (result, recorded) = match executor {
-            Executor::Native(route) => (route.execute(&attempt).await, false),
-            Executor::Host => (
-                self.host.invoke(&attempt).await,
-                self.host.records_outcomes(),
-            ),
-        };
-        match result {
+        // Every attempt runs through the host; the core records every outcome itself.
+        match self.host.invoke(&attempt).await {
             Ok(output) => {
-                if !recorded
-                    && let Err(error) = self
+                if let Err(error) = self
                         .health
                         .record_success(&deployment, output.total_tokens)
                         .await
@@ -499,16 +494,8 @@ impl Core {
                 })
             }
             Err(failure) => {
-                if recorded {
-                    self.host.observe(&RouterEvent::AttemptFailed {
-                        deployment_id: deployment.id.clone(),
-                        kind: failure.kind,
-                        status: failure.status,
-                    });
-                } else {
-                    self.record_failure(snapshot, &candidates, &deployment, &failure)
-                        .await;
-                }
+                self.record_failure(snapshot, &candidates, &deployment, &failure)
+                    .await;
                 Err(Failed {
                     error: Error::Attempt(failure),
                     deployment_id: Some(deployment.id.clone()),

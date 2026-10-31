@@ -442,6 +442,51 @@ impl Registry {
             })
     }
 
+    /// `resolve` for a caller: a team's own deployments under their public name win
+    /// (`_core_get_all_deployments` with `team_id`), then the name as [`Self::resolve`] reads it,
+    /// then deployments whose `litellm_params.model` is the name (`_get_deployment_by_litellm_model`).
+    pub fn resolve_for(
+        &self,
+        name: &str,
+        scope: ResolveScope,
+        team_id: Option<&str>,
+    ) -> Option<Resolution> {
+        if let Some(team) = team_id
+            && !scope.specific_deployment
+        {
+            let own: Vec<Arc<Deployment>> = self
+                .deployments
+                .iter()
+                .filter(|d| {
+                    d.model_info.team_id.as_deref() == Some(team)
+                        && d.model_info.team_public_model_name.as_deref() == Some(name)
+                })
+                .cloned()
+                .collect();
+            if !own.is_empty() {
+                return Some(Resolution {
+                    kind: ResolveKind::Group,
+                    group: name.to_owned(),
+                    deployments: own,
+                });
+            }
+        }
+        if let Some(resolution) = self.resolve(name, scope) {
+            return Some(resolution);
+        }
+        let by_model: Vec<Arc<Deployment>> = self
+            .deployments
+            .iter()
+            .filter(|d| d.params.model == name)
+            .cloned()
+            .collect();
+        (!by_model.is_empty()).then(|| Resolution {
+            kind: ResolveKind::Group,
+            group: name.to_owned(),
+            deployments: by_model,
+        })
+    }
+
     /// Access group name to the model groups in it.
     pub fn access_groups(&self) -> BTreeMap<String, BTreeSet<String>> {
         let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

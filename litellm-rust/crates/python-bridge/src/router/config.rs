@@ -192,6 +192,9 @@ struct ChangesSpec {
     upsert: Vec<DeploymentSpec>,
     #[serde(default)]
     delete: Vec<String>,
+    /// A new dynamic document (the same keys `RouterCoreHandle(static, dynamic)` takes).
+    #[serde(default)]
+    settings: Option<Value>,
 }
 
 pub(crate) fn changes(value: Value) -> Result<ChangeSet, Error> {
@@ -199,7 +202,7 @@ pub(crate) fn changes(value: Value) -> Result<ChangeSet, Error> {
     Ok(ChangeSet {
         upserts: spec.upsert,
         deletes: spec.delete,
-        settings: None,
+        settings: spec.settings.map(dynamic_config).transpose()?,
     })
 }
 

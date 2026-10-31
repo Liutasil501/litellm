@@ -1,5 +1,7 @@
-//! [`Host`]: what the embedding process provides. `PythonHost` serves it from the existing Python
-//! code; `NativeHost` serves it in the Rust server.
+//! [`Host`]: the router core's only boundary. Everything the core needs from the embedding
+//! process goes through it, and every attempt runs through [`Host::invoke`]: the core never runs
+//! an operation itself. `PythonHost` serves it in a Python process (attempts call `litellm.<op>`);
+//! `NativeHost` serves it in the Rust server (attempts call the `inference-*` crates).
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -127,7 +129,8 @@ pub enum RouterEvent {
 
 #[async_trait]
 pub trait Host: Send + Sync {
-    /// Run a non-native attempt.
+    /// Run one attempt against the picked deployment. The core records its outcome (cooldowns,
+    /// allowed-fails counters, usage) itself; the host only runs it.
     async fn invoke(&self, attempt: &Attempt) -> Result<Output, AttemptError>;
 
     /// Run a selection stage the core does not implement.
@@ -148,21 +151,15 @@ pub trait Host: Send + Sync {
     /// The shared store routing state lives in.
     fn cache(&self) -> Arc<dyn RouterCache>;
 
-    /// Whether [`Self::invoke`] can run an attempt. A `NativeHost` cannot, so every served
-    /// operation needs a native executor.
-    fn can_invoke(&self) -> bool {
+    /// Whether [`Self::invoke`] can run `op` on `provider`. Checked for every served op and
+    /// deployment when the router is built or changed, so an unsupported pair fails the config,
+    /// never a request. `PythonHost` runs every op; `NativeHost` only those with a Rust route.
+    fn supports(&self, _op: &Op, _provider: &str) -> bool {
         true
     }
 
     /// Whether [`Self::select`] can run strategies and plugins.
     fn can_select(&self) -> bool {
         true
-    }
-
-    /// Whether [`Self::invoke`] records each attempt's outcome itself (cooldowns, allowed-fails
-    /// counters, usage), as the Python router's own callbacks do. The core then leaves the
-    /// health store to the host for host-run attempts, so no failure is counted twice.
-    fn records_outcomes(&self) -> bool {
-        false
     }
 }

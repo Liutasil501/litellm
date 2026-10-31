@@ -105,6 +105,10 @@ impl CacheOutcome {
 pub(crate) enum Ask {
     Attempt {
         deployment_id: String,
+        /// The picked deployment as configured: `model_name`, `litellm_params`, `model_info`
+        /// (with its `id`). The host builds the request from it; it never looks the deployment up
+        /// in a Python router.
+        deployment: Value,
         /// The name the attempt resolved: the requested name or the fallback target.
         model: String,
         model_group: String,
@@ -214,6 +218,8 @@ pub(crate) enum Finish {
         deployment_id: String,
         model_group: String,
     },
+    /// `report_failure`: whether the deployment was cooled down.
+    Reported { cooled: bool },
 }
 
 /// One step of a call: what it is blocked on, or how it ended.
@@ -405,6 +411,17 @@ impl RouterCache for StepCache {
     }
 }
 
+/// A deployment as Python spells a `model_list` entry, with its id in `model_info`.
+pub(crate) fn deployment_record(deployment: &Deployment) -> Value {
+    let mut model_info = deployment.model_info.raw.clone();
+    model_info.insert("id".to_owned(), Value::String(deployment.id.clone()));
+    serde_json::json!({
+        "model_name": deployment.model_name,
+        "litellm_params": deployment.raw_params,
+        "model_info": model_info,
+    })
+}
+
 /// The [`Host`] every `RouterCoreHandle` router runs on.
 pub(crate) struct StepHost;
 
@@ -413,6 +430,7 @@ impl Host for StepHost {
     async fn invoke(&self, attempt: &Attempt) -> Result<Output, AttemptError> {
         let question = Ask::Attempt {
             deployment_id: attempt.deployment.id.clone(),
+            deployment: deployment_record(&attempt.deployment),
             model: attempt.name.clone(),
             model_group: attempt.model_group.clone(),
             target_order: attempt.target_order,
@@ -493,12 +511,6 @@ impl Host for StepHost {
 
     fn cache(&self) -> Arc<dyn RouterCache> {
         Arc::new(StepCache)
-    }
-
-    /// Each attempt runs through the Python router, whose callbacks record cooldowns,
-    /// allowed-fails counters and usage.
-    fn records_outcomes(&self) -> bool {
-        true
     }
 }
 
@@ -791,12 +803,12 @@ mod tests {
         }
     }
 
-    /// Each attempt runs `PythonCore.call`, which records its own cooldowns, fail counters and
-    /// usage, so the Rust call loop writes none of them.
+    /// The host only runs the attempt; the core records its outcome (cooldowns, fail counters,
+    /// usage) through the host's cache.
     #[rstest]
     #[case::failure(rate_limited())]
     #[case::success(Answer::Attempt(Ok(7)))]
-    fn attempt_outcomes_are_recorded_by_the_python_attempt(#[case] outcome: Answer) {
+    fn attempt_outcomes_are_recorded_by_the_core(#[case] outcome: Answer) {
         let tracked = |id: &str| {
             json!({
                 "model_name": "primary",
@@ -823,7 +835,7 @@ mod tests {
                 matches!(ask, Ask::Cache { op, .. } if !matches!(op, CacheOp::Get | CacheOp::BatchGet))
             })
             .collect();
-        assert!(writes.is_empty(), "{writes:?}");
+        assert!(!writes.is_empty(), "the core wrote no outcome");
     }
 
     #[rstest]

@@ -149,7 +149,7 @@ impl Core {
         };
         let dynamic = &snapshot.settings.dynamic;
         let resolution = registry
-            .resolve(name, scope)
+            .resolve_for(name, scope, request.team_id.as_deref())
             .or_else(|| {
                 // No deployment for the name: route to the first default fallback.
                 let default = dynamic

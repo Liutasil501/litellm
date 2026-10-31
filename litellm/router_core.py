@@ -1,9 +1,10 @@
 """
 ``RouterCore``: the interface ``litellm.Router`` delegates to, and ``make_core``, which picks one.
 
-``PythonCore`` (``litellm/router_python_core.py``) is today's routing logic. The Rust core
-(litellm-rust/crates/router-core) implements the same operations. The core is picked once, when
-the router is built, from its ``RouterConfig``.
+``PythonCore`` (``litellm/router_python_core.py``) is today's routing logic. ``RustCore``
+(``litellm/router_rust_core.py`` over litellm-rust/crates/router-core) is a separate implementation
+that reaches outside itself only through its host; it does not use ``PythonCore``. The core is
+picked once, when the router is built, from its ``RouterConfig``.
 """
 
 from collections.abc import Mapping
@@ -54,7 +55,8 @@ class RouterCore(Protocol):
 def make_core(config: RouterConfig, host: "PythonHost", core_class: "type[PythonCore] | None" = None) -> RouterCore:
     """
     The Rust core when the route catalog's router rule allows it and the Rust core serves this
-    config, else the Python core. Decided once, for the router's life.
+    config, else the Python core. Decided once, for the router's life, from the config alone: the
+    Rust core never builds, wraps or falls back to a Python core.
     """
     from litellm.router_python_core import PythonCore
     from litellm.rust_bridge.catalog import Route, RouteContext, decision
@@ -63,17 +65,14 @@ def make_core(config: RouterConfig, host: "PythonHost", core_class: "type[Python
     python_class: Final = core_class or PythonCore
     chosen: Final = decision(RouteContext(Route.ROUTER))
     if chosen is not Decision.PYTHON:
-        from litellm.router_rust_core import RustCore, RustCoreDeclined
+        from litellm.router_rust_core import RustCore
         from litellm.rust_bridge._native import RustBridgeDeclined
 
         try:
-            return RustCore.build(config, host, python_class)  # pyright: ignore[reportReturnType]  # RustCore serves the rest of RouterCore from its PythonCore, through __getattr__
-        except (RustBridgeDeclined, RustCoreDeclined) as declined:
-            # A config the Rust core cannot take keeps the router on Python; an error building the
-            # Python core itself is the router's own error and is raised once, as it is.
+            return RustCore.build(config, host)  # pyright: ignore[reportReturnType]  # RustCore serves the RouterCore entry points; other members raise RustCoreUnsupported
+        except RustBridgeDeclined as declined:
+            # A config the Rust core cannot take keeps the router on Python while both cores exist.
             if chosen is Decision.RUST_REQUIRED:
                 raise
             verbose_router_logger.info("Router served by the Python core: %s", declined)
-            if isinstance(declined, RustCoreDeclined):
-                return declined.python
     return python_class(**config.arguments, _host=host)  # pyright: ignore[reportArgumentType]  # the arguments were bound against PythonCore's own signature

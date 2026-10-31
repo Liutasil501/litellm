@@ -43,19 +43,21 @@
 //! - `call(op, request)`: select, run the attempt, and retry or fall back until it succeeds or the
 //!   policy is exhausted.
 //!
-//! # Execution
-//! Each attempt resolves an `Executor` after a deployment is picked. A Rust-native operation runs
-//! its `inference-*` route machine in-process; anything else goes through `Host::invoke`. A
-//! started attempt is never replayed on a different executor.
+//! # Hosts: the only boundary
+//! The core reaches outside itself only through [`Host`], and every attempt runs through
+//! `Host::invoke`: the core picks the deployment, the host runs the call, the core records the
+//! outcome. There is no second, "native" attempt path in the core. Which code runs an attempt is
+//! the host's business:
+//! - `PythonHost` (inside a Python process) builds the request for the picked deployment and calls
+//!   `litellm.<op>`. It never calls back into a Python router.
+//! - `NativeHost` (the Rust server) calls the `inference-*` crates. An op or provider it cannot run
+//!   fails `Host::supports` when the router is built or changed, never partway through a request.
 //!
-//! # Hosts
-//! `Host` is what the embedding process provides: `invoke` for non-native operations, `select`
-//! for strategies and sub-routers not yet ported, `allow_fallback` for access and budget checks,
-//! `sleep`, `observe` for routing events, and `cache`, a DualCache-style store that holds all
-//! routing state under the same keys, encodings and TTLs the Python router uses. `PythonHost`
-//! serves them from the existing Python code when the router runs inside Python; `NativeHost`
-//! serves them in the Rust server, where an operation without a Rust implementation makes the
-//! config fail at build time, never partway through a request.
+//! Besides `invoke` and `supports`, a host provides `select` for strategies and plugins not yet
+//! ported, `allow_fallback` for access and budget checks, `sleep`, `observe` for routing events,
+//! and `cache`, a DualCache-style store that holds all routing state under the same keys,
+//! encodings and TTLs the Python router uses. The core writes cooldowns, allowed-fails counters
+//! and usage itself, through that cache.
 //!
 //! # Plugins
 //! Routing strategies, pre-call checks and sub-routers (auto, complexity, quality, adaptive)
@@ -68,13 +70,12 @@
 //! - [`cache`] / [`health`]: the shared routing cache, cooldowns and usage.
 //! - [`select`]: resolve, filter chain, simple-shuffle.
 //! - [`call`]: retries and fallbacks.
-//! - [`host`] / [`executor`]: the `Host` seam and per-attempt executors.
+//! - [`host`]: the `Host` boundary.
 
 pub mod cache;
 pub mod call;
 pub mod config;
 pub mod error;
-pub mod executor;
 pub mod health;
 pub mod host;
 pub mod registry;
@@ -94,7 +95,6 @@ pub use crate::{
     call::RouterResponse,
     config::{Op, RouterConfig, RouterDynamicConfig, RoutingStrategy},
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
-    executor::{Executor, Executors, NativeRoute},
     health::{Clock, Health, Outcome, SystemClock},
     host::{Attempt, Host, Output, RouterEvent, RouterRequest, RoutingContext, SelectStage},
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
@@ -111,7 +111,6 @@ pub(crate) struct Snapshot {
 
 pub(crate) struct Core {
     host: Arc<dyn Host>,
-    executors: Executors,
     rng: Arc<dyn Randomness>,
     health: Health,
     config: RouterConfig,
@@ -142,32 +141,29 @@ impl Core {
         }
         for deployment in registry.deployments(&DeploymentFilter::default()) {
             for op in &self.config.served_ops {
-                self.executors.resolve(op, deployment.provider())?;
+                if !self.host.supports(op, deployment.provider()) {
+                    return Err(Unsupported::Op {
+                        op: op.clone(),
+                        provider: deployment.provider().to_owned(),
+                    }
+                    .into());
+                }
             }
         }
         Ok(())
     }
 }
 
-/// Builds a [`Router`], with native routes and test seams.
+/// Builds a [`Router`], with test seams.
 pub struct RouterBuilder {
     config: RouterConfig,
     dynamic: RouterDynamicConfig,
     host: Arc<dyn Host>,
-    executors: Executors,
     rng: Arc<dyn Randomness>,
     clock: Arc<dyn Clock>,
 }
 
 impl RouterBuilder {
-    /// Register a native route for an (op, provider) rule; a pair outside
-    /// [`executor::NATIVE_RULES`] is ignored and stays on the host.
-    #[must_use]
-    pub fn native_route(mut self, op: Op, provider: &str, route: Arc<dyn NativeRoute>) -> Self {
-        self.executors.register(op, provider, route);
-        self
-    }
-
     #[must_use]
     pub fn randomness(self, rng: Arc<dyn Randomness>) -> Self {
         Self { rng, ..self }
@@ -188,7 +184,6 @@ impl RouterBuilder {
         let core = Core {
             health: Health::new(self.host.cache(), self.clock),
             host: self.host,
-            executors: self.executors,
             rng: self.rng,
             config: self.config,
             snapshot: ArcSwap::from_pointee(Snapshot {
@@ -230,7 +225,6 @@ impl Router {
         host: Arc<dyn Host>,
     ) -> RouterBuilder {
         RouterBuilder {
-            executors: Executors::new(host.can_invoke()),
             config,
             dynamic,
             host,
@@ -282,19 +276,20 @@ impl Router {
         &self.core.health
     }
 
-    /// Record an outcome the router did not see itself, such as a health check.
-    pub async fn report(&self, id: &str, outcome: Outcome) -> Result<(), Error> {
+    /// Record an outcome the router did not see itself, such as a health check. Returns whether
+    /// the deployment was cooled down.
+    pub async fn report(&self, id: &str, outcome: Outcome) -> Result<bool, Error> {
         let snapshot = self.core.snapshot.load_full();
         let Some(deployment) = snapshot.registry.deployment(id) else {
-            return Ok(());
+            return Ok(false);
         };
         match outcome {
-            Outcome::Success { total_tokens } => {
-                self.core
-                    .health
-                    .record_success(&deployment, total_tokens)
-                    .await
-            }
+            Outcome::Success { total_tokens } => self
+                .core
+                .health
+                .record_success(&deployment, total_tokens)
+                .await
+                .map(|()| false),
             Outcome::Failure(failure) => {
                 let shape = GroupShape {
                     single_deployment: snapshot
@@ -311,7 +306,7 @@ impl Router {
                     .health
                     .record_failure(&snapshot.settings, &deployment, shape, &failure)
                     .await
-                    .map(drop)
+                    .map(|cooldown| cooldown.is_some())
             }
         }
     }

@@ -7,6 +7,7 @@ come from ``dynamic()`` (``litellm/router_config.py``). A Rust core gets the sam
 """
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import (
     TYPE_CHECKING,
@@ -19,12 +20,13 @@ from typing import (
 from typing_extensions import overload
 
 import litellm
-from litellm.router_config import RouterDynamicConfig, live_dynamic_config
+from litellm.router_config import RouterConfig, RouterDynamicConfig, live_dynamic_config
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
     from litellm.caching.caching import Cache
+    from litellm.caching.dual_cache import DualCache
     from litellm.litellm_core_utils.logging_callback_manager import LoggingCallbackManager
     from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
     from litellm.text_completions.streaming_iterator import TextCompletionStreamWrapper
@@ -107,6 +109,10 @@ class PythonHost:
     def sleep(self, seconds: float) -> Awaitable[None]:
         return asyncio.sleep(seconds)
 
+    def sleep_sync(self, seconds: float) -> None:
+        """The backoff of a sync endpoint's retry."""
+        time.sleep(seconds)
+
     def dynamic(self) -> RouterDynamicConfig:
         """The process settings, read live on each access (``current_dynamic_config()`` takes a snapshot)."""
         return cast(RouterDynamicConfig, live_dynamic_config)  # cast-ok: the live view reads the same fields
@@ -130,6 +136,50 @@ class PythonHost:
 
     def suppress_debug_info(self) -> None:
         litellm.suppress_debug_info = True
+
+    def routing_cache(self, config: RouterConfig) -> "DualCache":
+        """The store a router keeps its routing state in (cooldowns, fail counts, usage): in memory,
+        plus Redis when the router's arguments name one. The host builds and owns it; a Rust core
+        reads and writes it through cache steps."""
+        from litellm.caching.caching import DualCache, InMemoryCache
+
+        return DualCache(redis_cache=redis_cache_for(config), in_memory_cache=InMemoryCache())
+
+
+def redis_cache_for(config: RouterConfig) -> object:
+    """The Redis cache the router's ``redis_*`` and ``cache_kwargs`` arguments describe, or None."""
+    import json
+
+    from litellm.caching.caching import RedisCache, RedisClusterCache
+    from litellm.utils import get_secret
+
+    url: Final = config.get("redis_url")
+    host: Final = config.get("redis_host")
+    port: Final = config.get("redis_port")
+    if url is None and (host is None or port is None):
+        return None
+    settings: Final[dict[str, object]] = {}  # mutable-ok: built here, then passed as keywords
+    if url is not None:
+        settings["url"] = url
+    if host is not None:
+        settings["host"] = host
+    if port is not None:
+        settings["port"] = str(port)
+    if config.get("redis_password") is not None:
+        settings["password"] = config.get("redis_password")
+    if config.get("redis_db") is not None:
+        settings["db"] = str(config.get("redis_db"))
+    extra: Final = config.get("cache_kwargs")
+    if isinstance(extra, dict):
+        settings.update({str(key): value for key, value in extra.items()})  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # the cache_kwargs argument is untyped
+    nodes: object = settings.get("startup_nodes")  # rebind-ok: the env cluster nodes when the arguments name none
+    if not nodes:
+        env_nodes: Final = get_secret("REDIS_CLUSTER_NODES")
+        if isinstance(env_nodes, str):
+            nodes = json.loads(env_nodes)  # rebind-ok: see above
+    if nodes:
+        return RedisClusterCache(**{**settings, "startup_nodes": nodes})  # pyright: ignore[reportArgumentType]  # RedisCache's keyword arguments
+    return RedisCache(**settings)  # pyright: ignore[reportArgumentType]  # RedisCache's keyword arguments
 
 
 python_host: Final = PythonHost()

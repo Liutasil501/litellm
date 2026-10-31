@@ -1,61 +1,94 @@
 """
 ``RustCore``: the router core served by litellm-rust/crates/router-core through ``_native``.
 
-The Rust core owns the registry, selection, retries, fallbacks and cooldowns for the operations in
-``RUST_SERVED_OPS``. It never awaits Python: ``RouterCall.next`` returns the step the call loop is
-blocked on (run an attempt on a deployment, sleep, check a fallback target, run a plugin) and this
-driver answers it. Each attempt runs through the Python core with that one deployment, so request
-preparation, inference, logging and cost tracking are unchanged.
+The Rust core owns the registry, selection, retries, fallbacks and cooldowns. It reaches outside
+itself only through its host, and the host never calls back into a Python router:
 
-Everything else (the views, runtime writes, every other endpoint) is served by the ``PythonCore``
-the Rust core wraps, built from the same config. A config the Rust core cannot serve fails at
-construction and ``make_core`` builds a ``PythonCore`` instead.
+- every attempt runs through the host: ``router_attempt`` builds the request for the one
+  deployment Rust picked and ``PythonHost.invoke(op)`` calls ``litellm.<op>`` with it
+- the core records every outcome (cooldowns, allowed-fails counters, usage) itself, in the routing
+  cache the host builds and owns (``PythonHost.routing_cache``)
+- sleeps, fallback access and budget checks, and cache reads and writes are host steps
+
+``RustCore`` does not build, wrap or read a ``PythonCore``. Settings are resolved from the
+``RouterConfig`` and the host's process settings; the views (``registry()``, ``settings()``,
+``health()``) are read from the Rust handle. A member the Rust core does not serve raises
+``RustCoreUnsupported`` (an ``AttributeError``) instead of reaching a Python core, so deleting
+``router_python_core.py`` cannot change what this core does.
 """
 
+import dataclasses
 import inspect
 import json
 import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from pydantic import TypeAdapter
 
-from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
 from litellm.litellm_core_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
     add_retry_headers_to_response,
+    apply_remaining_usage_headers,
+    apply_response_model_id,
+    ensure_response_additional_headers,
+    prepare_response_for_header_attachment,
 )
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
-from litellm.litellm_core_utils.routing_common_utils import (
-    format_content_policy_fallback_hint,
-    format_fallback_outcome_message,
-    format_no_fallback_group_message,
-    truncate_fallback_error_detail,
+from litellm.litellm_core_utils.routing_common_utils import format_fallback_outcome_message
+from litellm.router_api import (
+    ApplyResult,
+    ChangeSet,
+    RouterHealth,
+    RouterRegistry,
+    RouterSettings,
+    RoutingContext,
+    RoutingObservers,
 )
-from litellm.litellm_core_utils.secret_redaction import redact_string
-from litellm.litellm_core_utils.sensitive_data_masker import mask_sensitive_structure
-from litellm.router_config import RouterConfig
-from litellm.router_python_core import PythonCore
+from litellm.router_attempt import (
+    attempt_kwargs,
+    metadata_field,
+    prepare_call,
+    request_from_call,
+    stamp_attempt_error,
+)
+from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
-from litellm.router_utils.fallback_event_handlers import (
-    AttemptedFallbackTargets,
-    _provider_prefixed_model_group,  # pyright: ignore[reportPrivateUsage]  # the Python fallback walk's own spelling rule
-    fallback_lookup_groups,
-    get_fallback_model_group_for_lookup_groups,
-    is_bad_request_without_fallback,
-)
-from litellm.types.router import FallbackSkipReason
+from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
 from litellm.types.utils import LlmProviders
 
 if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
+    from litellm.router_utils.cooldown_cache import CooldownCache
     from litellm.rust_bridge._native import RouterCall, RouterCoreHandle
+    from litellm.types.router import CustomRoutingStrategyBase
 
-RustServedOp: TypeAlias = Literal["acompletion", "aanthropic_messages", "aembedding", "aresponses"]
-RUST_SERVED_OPS: Final[frozenset[str]] = frozenset({"acompletion", "aanthropic_messages", "aembedding", "aresponses"})
+# Async endpoints the Rust core routes: select a deployment, then run the attempt on the host.
+RUST_SERVED_OPS: Final[frozenset[str]] = frozenset(
+    {
+        "acompletion",
+        "atext_completion",
+        "aembedding",
+        "aresponses",
+        "aanthropic_messages",
+        "aimage_generation",
+        "atranscription",
+        "aspeech",
+        "arerank",
+        "amoderation",
+    }
+)
+# Sync endpoints, routed the same way with the host's sync endpoint and sync cache.
+SYNC_OPS: Final = MappingProxyType(
+    {
+        "completion": "acompletion",
+        "text_completion": "atext_completion",
+        "embedding": "aembedding",
+        "image_generation": "aimage_generation",
+    }
+)
 
 _FAILURE_KINDS: Final = (
     "RateLimitError",
@@ -75,11 +108,59 @@ _FAILURE_KINDS: Final = (
 )
 _DECLINED: Final = frozenset({"MalformedRequestFieldError", "UnsupportedEndpointError"})
 _STEP: Final = TypeAdapter(Mapping[str, object])
-_REQUEST_FIELDS: Final = ("specific_deployment", "num_retries", "disable_fallbacks")
-# Request keys router-core reads under another name.
-_RENAMED_REQUEST_FIELDS: Final = MappingProxyType({"_router_weights": "router_weights"})
+# The litellm function an op's attempt calls, where it differs from the op's name.
+_HOST_ENDPOINTS: Final = MappingProxyType({"aanthropic_messages": "anthropic_messages"})
 _PROVIDERS: Final = tuple(provider.value for provider in LlmProviders)
-_PYTHON_ONLY_REQUEST_KEYS: Final = frozenset(
+_DEFAULT_COOLDOWN_SECONDS: Final = 5.0
+
+# Constructor arguments this core reads. Any other argument set to something other than its
+# unset value keeps the router on the Python core while both exist (make_core decides that from
+# the config alone, before any core is built).
+_SERVED_ARGUMENTS: Final = frozenset(
+    {
+        "model_list",
+        "routing_strategy",
+        "model_group_alias",
+        "fallbacks",
+        "default_fallbacks",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
+        "num_retries",
+        "max_fallbacks",
+        "allowed_fails",
+        "cooldown_time",
+        "disable_cooldowns",
+        "allowed_fails_policy",
+        "retry_after",
+        "timeout",
+        "default_litellm_params",
+        "fallback_access_check",
+        "fallback_budget_check",
+        "redis_url",
+        "redis_host",
+        "redis_port",
+        "redis_password",
+        "redis_db",
+        "cache_kwargs",
+        "set_verbose",
+        "debug_level",
+    }
+)
+# Arguments that may be passed at their default without asking for anything.
+_UNSET_DEFAULTS: Final = MappingProxyType(
+    {
+        "client_ttl": 3600,
+        "cache_responses": False,
+        "routing_strategy_args": {},
+        "enable_pre_call_checks": False,
+        "enable_tag_filtering": False,
+        "retry_policy": None,
+        "model_group_retry_policy": {},
+    }
+)
+# Per-request routing overrides this core does not read yet: such a request is refused, not
+# rerouted to another core.
+_UNSERVED_REQUEST_KEYS: Final = frozenset(
     {
         "fallbacks",
         "context_window_fallbacks",
@@ -90,37 +171,32 @@ _PYTHON_ONLY_REQUEST_KEYS: Final = frozenset(
         "retry_policy",
     }
 )
-_STATIC_FIELDS: Final = (
-    "routing_strategy",
-    "cooldown_time",
-    "disable_cooldowns",
-    "allowed_fails_policy",
-    "retry_after",
-    "timeout",
+# Settings a changeset may change. Static ones rebuild the Rust core (settings are fixed for a
+# core's life); dynamic ones are handed to it as a new dynamic document.
+_STATIC_SETTINGS: Final = frozenset(
+    {"routing_strategy", "cooldown_time", "disable_cooldowns", "allowed_fails_policy", "retry_after", "timeout"}
 )
-_HANDLED_FIELDS: Final = frozenset(
+_DYNAMIC_SETTINGS: Final = frozenset(
     {
-        *_STATIC_FIELDS,
-        "model_list",
-        "model_group_alias",
         "fallbacks",
-        "default_fallbacks",
         "context_window_fallbacks",
         "content_policy_fallbacks",
         "num_retries",
         "max_fallbacks",
         "allowed_fails",
-        "set_verbose",
-        "debug_level",
+        "model_group_alias",
+        "default_litellm_params",
+        "fallback_access_check",
+        "fallback_budget_check",
     }
 )
-_PYTHON_DEFAULTS: Final = MappingProxyType(
-    {
-        name: parameter.default
-        for name, parameter in inspect.signature(PythonCore).parameters.items()
-        if parameter.default is not inspect.Parameter.empty
-    }
-)
+
+
+class RustCoreUnsupported(AttributeError):
+    """A member or request the Rust core does not serve. It is never forwarded to a Python core."""
+
+
+# --- failures -----------------------------------------------------------------------------------
 
 
 def failure_kind(error: BaseException) -> str:
@@ -165,8 +241,12 @@ def total_tokens(response: object) -> int:
     return tokens if isinstance(tokens, int) else 0
 
 
+# --- settings -----------------------------------------------------------------------------------
+
+
 def _json_default(value: object) -> object:
-    return str(value)
+    dump: Final = getattr(value, "model_dump", None)
+    return dump(exclude_none=True) if callable(dump) else str(value)
 
 
 def _plain(value: object) -> object:
@@ -174,281 +254,869 @@ def _plain(value: object) -> object:
     return json.loads(json.dumps(value, default=_json_default))
 
 
-def _plain_document(value: Mapping[str, object]) -> Mapping[str, object]:
-    """A mapping as plain JSON values: still a mapping, with string keys."""
-    return as_str_mapping(_plain(value)) or MappingProxyType({})
-
-
 def _as_list(value: object) -> Sequence[object]:
     return value if isinstance(value, list) else ()  # pyright: ignore[reportUnknownVariableType]  # a list's items are read as objects
 
 
-def _applied_static(python: PythonCore, name: str) -> object:
-    """Where an applied static setting lands on the Python core: the value the Rust core is rebuilt with."""
-    match name:
-        case "routing_strategy":
-            return python.settings().routing_strategy
-        case "cooldown_time":
-            return python.settings().cooldown_time
-        case "disable_cooldowns":
-            return python.settings().disable_cooldowns
-        case "allowed_fails_policy":
-            return python.settings().allowed_fails_policy
-        case "retry_after":
-            return python.retry_after
-        case "timeout":
-            return python.timeout
-        case _:
-            raise KeyError(name)
+@dataclasses.dataclass(frozen=True, slots=True)
+class Resolved:
+    """The router's settings, resolved from its arguments and the process settings the way the
+    Python router's constructor resolves them. Replaced, never changed, by ``apply``."""
+
+    routing_strategy: str
+    num_retries: int
+    max_fallbacks: int
+    allowed_fails: int
+    explicit_allowed_fails: int | None
+    cooldown_time: float
+    disable_cooldowns: bool | None
+    allowed_fails_policy: object
+    retry_after: float
+    timeout: float | None
+    fallbacks: list[object] | None  # mutable-ok: the setting as Python spells it
+    context_window_fallbacks: list[object] | None  # mutable-ok: same
+    content_policy_fallbacks: list[object] | None  # mutable-ok: same
+    model_group_alias: Mapping[str, object]
+    default_litellm_params: Mapping[str, object]
+    fallback_access_check: object
+    fallback_budget_check: object
+    assigned: frozenset[str] = frozenset()
+
+    @classmethod
+    def of(cls, config: RouterConfig, dynamic: RouterDynamicConfig) -> "Resolved":
+        get: Final = config.get
+        fallbacks: list[object] | None = list(_as_list(get("fallbacks"))) or (  # rebind-ok: default_fallbacks extend it
+            list(dynamic.fallbacks) if dynamic.fallbacks else None
+        )
+        default_fallbacks: Final = get("default_fallbacks") or dynamic.default_fallbacks
+        if default_fallbacks is not None:
+            if isinstance(default_fallbacks, str):
+                raise TypeError(
+                    f"default_fallbacks must be a list of model names, got '{default_fallbacks}'. Use ['{default_fallbacks}']"
+                )
+            fallbacks = [*(fallbacks or ()), {"*": list(default_fallbacks)}]  # pyright: ignore[reportArgumentType]  # a list of names
+        num_retries: Final = get("num_retries")
+        max_fallbacks: Final = get("max_fallbacks")
+        allowed_fails: Final = get("allowed_fails")
+        timeout: Final = get("timeout")
+        return cls(
+            routing_strategy=str(get("routing_strategy") or "simple-shuffle"),
+            num_retries=int(str(num_retries))
+            if num_retries is not None
+            else dynamic.num_retries
+            if dynamic.num_retries is not None
+            else 2,
+            max_fallbacks=int(str(max_fallbacks))
+            if max_fallbacks is not None
+            else dynamic.max_fallbacks
+            if dynamic.max_fallbacks is not None
+            else dynamic.router_max_fallbacks,
+            allowed_fails=int(str(allowed_fails)) if allowed_fails is not None else dynamic.allowed_fails,
+            explicit_allowed_fails=int(str(allowed_fails)) if allowed_fails is not None else None,
+            cooldown_time=float(str(get("cooldown_time") or _DEFAULT_COOLDOWN_SECONDS)),
+            disable_cooldowns=_optional_bool(get("disable_cooldowns")),
+            allowed_fails_policy=get("allowed_fails_policy"),
+            retry_after=float(str(get("retry_after") or 0)),
+            timeout=float(str(timeout)) if timeout else dynamic.request_timeout,
+            fallbacks=fallbacks,
+            context_window_fallbacks=list(_as_list(get("context_window_fallbacks")))
+            or (list(dynamic.context_window_fallbacks) if dynamic.context_window_fallbacks else None),
+            content_policy_fallbacks=list(_as_list(get("content_policy_fallbacks")))
+            or (list(dynamic.content_policy_fallbacks) if dynamic.content_policy_fallbacks else None),
+            model_group_alias=MappingProxyType(dict(as_str_mapping(get("model_group_alias")) or {})),
+            default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
+            fallback_access_check=get("fallback_access_check"),
+            fallback_budget_check=get("fallback_budget_check"),
+        )
+
+    def changed(self, values: Mapping[str, object]) -> "Resolved":
+        unknown: Final = sorted(set(values) - _STATIC_SETTINGS - _DYNAMIC_SETTINGS)
+        if unknown:
+            raise ValueError(f"the Rust router core does not serve the setting(s) {', '.join(unknown)}")
+        updates: Final[dict[str, object]] = {}  # mutable-ok: built here, then applied once
+        for name, value in values.items():
+            if name == "model_group_alias" or name == "default_litellm_params":
+                updates[name] = MappingProxyType(dict(as_str_mapping(value) or {}))
+            elif name in ("num_retries", "max_fallbacks", "allowed_fails"):
+                updates[name] = int(str(value))
+                if name == "allowed_fails":
+                    updates["explicit_allowed_fails"] = int(str(value))
+            elif name in ("cooldown_time", "retry_after"):
+                updates[name] = float(str(value or 0)) or (_DEFAULT_COOLDOWN_SECONDS if name == "cooldown_time" else 0.0)
+            elif name == "timeout":
+                updates[name] = float(str(value)) if value is not None else None
+            elif name == "routing_strategy":
+                updates[name] = str(value)
+            elif name == "disable_cooldowns":
+                updates[name] = _optional_bool(value)
+            elif name in ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks"):
+                updates[name] = list(_as_list(value)) or None
+            else:
+                updates[name] = value
+        return dataclasses.replace(self, **updates, assigned=self.assigned | frozenset(values))  # pyright: ignore[reportArgumentType]  # each value converted to its field's type above
+
+    def static_document(self, model_list: Sequence[object]) -> Mapping[str, object]:
+        values: Final = {
+            "model_list": _plain(list(model_list)),
+            "routing_strategy": self.routing_strategy,
+            "cooldown_time": self.cooldown_time,
+            "disable_cooldowns": self.disable_cooldowns,
+            "allowed_fails_policy": _plain(self.allowed_fails_policy),
+            "retry_after": self.retry_after,
+            "timeout": self.timeout,
+        }
+        return {name: value for name, value in values.items() if value is not None}
+
+    def dynamic_document(self, version: int, model_names: Sequence[str]) -> Mapping[str, object]:
+        values: Final = {
+            "version": version,
+            "model_group_alias": _plain(dict(self.model_group_alias)),
+            "fallbacks": _plain(self.fallbacks),
+            "context_window_fallbacks": _plain(self.context_window_fallbacks),
+            "content_policy_fallbacks": _plain(self.content_policy_fallbacks),
+            "num_retries": self.num_retries,
+            "max_fallbacks": self.max_fallbacks,
+            "allowed_fails": self.explicit_allowed_fails,
+            "fallback_keys": self._fallback_keys(model_names),
+        }
+        return {name: value for name, value in values.items() if value is not None}
+
+    def _fallback_keys(self, model_names: Sequence[str]) -> Mapping[str, object]:
+        """The spellings a fallback key matches besides the group name (`get_fallback_model_group`)."""
+        from litellm.router_utils.fallback_event_handlers import (
+            _provider_prefixed_model_group,  # pyright: ignore[reportPrivateUsage]  # the fallback walk's own spelling rule
+        )
+
+        keys: Final = tuple(  # comprehension-ok: the first group of each fallback entry, across the three lists
+            str(next(iter(mapping)))
+            for entries in (self.fallbacks, self.context_window_fallbacks, self.content_policy_fallbacks)
+            for entry in _as_list(entries)
+            if (mapping := as_str_mapping(entry))
+        )
+        names: Final = {*model_names, *self.model_group_alias}
+        prefixed: Final = {
+            name: spelled for name in names if (spelled := _provider_prefixed_model_group(name, keys)) is not None
+        }
+        return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
 
 
-def _static_value(value: object) -> object:
-    dump: Final = getattr(value, "model_dump", None)
-    return _plain(dump(exclude_none=True) if callable(dump) else value)
-
-
-def static_settings(config: RouterConfig, python: PythonCore) -> Mapping[str, object]:
-    """The static settings: the constructor arguments, overlaid with every setting a changeset
-    (``apply``) has changed since, as the Python core resolved it."""
-    applied: Final = python._core_applied  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-    values: Final[dict[str, object]] = {  # mutable-ok: the arguments, then the applied settings over them
-        name: config.arguments[name] for name in _STATIC_FIELDS if name in config.arguments
-    }
-    values.update({name: _applied_static(python, name) for name in _STATIC_FIELDS if name in applied})
-    return {name: _static_value(value) for name, value in values.items() if value is not None}
-
-
-def static_document(config: RouterConfig, python: PythonCore) -> Mapping[str, object]:
-    """The Python core's own normalized deployments (with their ids) and the static settings."""
-    return {
-        "model_list": _plain(python._core_model_list),  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownArgumentType]  # RustCore drives its own PythonCore, whose list is untyped
-        **static_settings(config, python),
-    }
-
-
-def dynamic_document(python: PythonCore) -> Mapping[str, object]:
-    """The values the Python core resolved from its arguments and the process settings."""
-    settings: Final = python.settings()
-    applied: Final = python._core_applied  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-    resolved: Final[Mapping[str, object]] = {  # pyright: ignore[reportUnknownVariableType]  # the fallback settings are untyped lists
-        "version": python._registry_version,  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        "model_group_alias": python._core_model_group_alias,  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        "fallbacks": settings.fallbacks,  # pyright: ignore[reportUnknownMemberType]  # the setting's own untyped list
-        "context_window_fallbacks": settings.context_window_fallbacks,  # pyright: ignore[reportUnknownMemberType]  # the setting's own untyped list
-        "content_policy_fallbacks": settings.content_policy_fallbacks,  # pyright: ignore[reportUnknownMemberType]  # the setting's own untyped list
-        "num_retries": python.num_retries,
-        "max_fallbacks": python.max_fallbacks,
-        "allowed_fails": python._core_allowed_fails  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        if "allowed_fails" in applied
-        else python.explicit_allowed_fails,
-        "fallback_keys": fallback_keys(python, settings),
-    }
-    return {name: _plain(value) for name, value in resolved.items() if value is not None}  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # the fallback settings are untyped lists
-
-
-def fallback_keys(python: PythonCore, settings: object) -> Mapping[str, object]:
-    """The spellings a fallback key matches besides the group name (`get_fallback_model_group`)."""
-    lists: Final = (
-        getattr(settings, "fallbacks", None),
-        getattr(settings, "context_window_fallbacks", None),
-        getattr(settings, "content_policy_fallbacks", None),
-    )
-    keys: Final = tuple(  # comprehension-ok: the first group of each fallback entry, across the three lists
-        str(next(iter(mapping)))
-        for entries in lists
-        for entry in _as_list(entries)
-        if (mapping := as_str_mapping(entry)) and isinstance(mapping, dict)
-    )
-    names: Final = {
-        *(python._core_model_names or ()),  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        *(python._core_model_group_alias or {}),  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-    }
-    prefixed: Final = {
-        name: spelled for name in names if (spelled := _provider_prefixed_model_group(name, keys)) is not None
-    }
-    return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
+def _optional_bool(value: object) -> bool | None:
+    return None if value is None else bool(value)
 
 
 def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
-    """Arguments the Rust core does not serve; any of them keeps the router on Python."""
-    changed: Final = frozenset(
+    """Arguments the Rust core does not serve."""
+    unserved: Final = frozenset(
         name
         for name, value in config.arguments.items()
-        if name not in _HANDLED_FIELDS and value != _PYTHON_DEFAULTS.get(name, None)
+        if name not in _SERVED_ARGUMENTS and value not in (None, _UNSET_DEFAULTS.get(name))
     )
-    strategy: Final = config.arguments.get("routing_strategy", "simple-shuffle")
-    model_list: Final = config.arguments.get("model_list")
-    # `simple_shuffle` raises on a non-numeric weight when it picks; the Python core keeps that.
+    strategy: Final = config.get("routing_strategy") or "simple-shuffle"
+    # `simple_shuffle` raises on a non-numeric weight when it picks; only the Python core keeps that.
     odd_weight: Final = any(
         (params := as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params"))) is not None
         and params.get("weight") is not None
         and (isinstance(params.get("weight"), bool) or not isinstance(params.get("weight"), int | float))
-        for deployment in _as_list(model_list)
+        for deployment in _as_list(config.get("model_list"))
     )
     return (
-        changed
+        unserved
         | ({"routing_strategy"} if strategy != "simple-shuffle" else frozenset[str]())
         | ({"model_list"} if odd_weight else frozenset[str]())
     )
 
 
-def runs_on_python(request: Mapping[str, object]) -> bool:
-    """Per-request routing overrides the Rust core does not read yet."""
-    return any(key in _PYTHON_ONLY_REQUEST_KEYS or key.startswith("mock_testing_") for key in request)
-
-
-def request_team_id(request: Mapping[str, object]) -> str | None:
+def _team_id(request: Mapping[str, object]) -> str | None:
     metadata: Final = as_str_mapping(request.get("metadata") or request.get("litellm_metadata"))
     team_id: Final = metadata.get("user_api_key_team_id") if metadata is not None else None
     return team_id if isinstance(team_id, str) else None
 
 
-def _bound_request(bound: inspect.BoundArguments) -> Mapping[str, object]:
-    """The keyword payload of a call bound to the Python core's endpoint signature."""
-    named: Final = {name: value for name, value in bound.arguments.items() if name not in ("self", "kwargs")}
-    extra: Final = bound.arguments.get("kwargs")
-    return {**named, **(extra if isinstance(extra, Mapping) else {})}
+def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
+    """The request fields the Rust core routes on."""
+    fields: Final = {
+        key: request[key]
+        for key in ("specific_deployment", "num_retries", "disable_fallbacks")
+        if request.get(key) is not None
+    }
+    weights: Final = request.get("_router_weights")
+    team_id: Final = _team_id(request)
+    return {
+        **fields,
+        **({"router_weights": weights} if weights is not None else {}),
+        **({"team_id": team_id} if team_id else {}),
+    }
 
 
-_ACOMPLETION: Final = inspect.signature(PythonCore.acompletion)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # only the parameter names are read
-_AEMBEDDING: Final = inspect.signature(PythonCore.aembedding)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # only the parameter names are read
-_OWN_ATTRIBUTES: Final = frozenset({"_handle", "_config", "_python", "_host", "_built_for"})
+def _deployment(record: object) -> Deployment:
+    return Deployment(**dict(as_str_mapping(record) or {}))  # pyright: ignore[reportArgumentType]  # a model_list entry
 
 
-class RustCoreDeclined(Exception):
-    """The Rust core cannot serve a router whose Python core is already built: the router keeps that one."""
-
-    def __init__(self, reason: str, python: PythonCore) -> None:
-        super().__init__(reason)
-        self.python = python
+# --- views --------------------------------------------------------------------------------------
 
 
-class RustCore:
-    """A ``RouterCore`` whose routing for ``RUST_SERVED_OPS`` runs in Rust, over a ``PythonCore``."""
+class RustRegistry(RouterRegistry):
+    """``registry()`` read from the Rust handle. Queries it does not serve raise ``RustCoreUnsupported``."""
 
-    def __init__(self, handle: "RouterCoreHandle", config: RouterConfig, python: PythonCore, host: PythonHost) -> None:
-        self._handle: RouterCoreHandle | None = handle
+    __slots__ = ("_core",)
+
+    def __init__(self, core: "RustCore") -> None:  # pyright: ignore[reportMissingSuperCall]  # reads the Rust core, not a Router
+        self._core = core
+
+    def __getattribute__(self, name: str) -> object:
+        if name in _REGISTRY_SERVED or name.startswith("__") or name == "_core":
+            return object.__getattribute__(self, name)
+        raise RustCoreUnsupported(f"registry().{name} is not served by the Rust router core", name=name, obj=self)
+
+    @property
+    def version(self) -> int:
+        return self._core._version  # pyright: ignore[reportPrivateUsage]  # the registry reads its own core
+
+    def _records(self) -> Sequence[Mapping[str, object]]:
+        return [as_str_mapping(record) or {} for record in self._core._handle.deployments()]  # pyright: ignore[reportPrivateUsage]  # see above
+
+    def deployment(self, id: str) -> Deployment | None:
+        record: Final = self._core._handle.deployment(id)  # pyright: ignore[reportPrivateUsage]  # see above
+        return None if record is None else _deployment(record)
+
+    def has_deployment(self, id: str) -> bool:
+        return self._core._handle.deployment(id) is not None  # pyright: ignore[reportPrivateUsage]  # see above
+
+    def deployment_dict(self, id: str) -> dict[str, object] | None:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh dict
+        record: Final = self._core._handle.deployment(id)  # pyright: ignore[reportPrivateUsage]  # see above
+        return None if record is None else dict(as_str_mapping(record) or {})
+
+    def deployments(  # pyright: ignore[reportIncompatibleMethodOverride]  # the "group" source only
+        self, model_name: str | None = None, *, source: str = "group", team_id: str | None = None, **_: object
+    ) -> list[Mapping[str, object]] | None:  # mutable-ok: a fresh list, as get_model_list returns
+        if source != "group":
+            raise RustCoreUnsupported(f"registry().deployments(source={source!r}) is not served by the Rust router core")
+        records: Final = self._records()
+        if model_name is None:
+            return list(records)
+        target: Final = self._target(model_name)
+        found: Final = [
+            record for record in records if record.get("model_name") == target and _usable_by(record, team_id)
+        ]
+        return found or None
+
+    def all(self) -> list[Mapping[str, object]]:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh list
+        return list(self._records())
+
+    def names(  # pyright: ignore[reportIncompatibleMethodOverride]  # the served kinds only
+        self,
+        model_name: str | None = None,
+        *,
+        kind: str = "groups",
+        team_id: str | None = None,
+        exclude_team_models: bool = False,
+    ) -> list[str] | set[str]:  # mutable-ok: fresh, as the Python core returns them
+        records: Final = self._records()
+        if kind == "ids":
+            return [
+                str((as_str_mapping(record.get("model_info")) or {}).get("id"))
+                for record in records
+                if (model_name is None or record.get("model_name") == model_name)
+                and not (exclude_team_models and _team_of(record) is not None)
+            ]
+        if kind == "group_set":
+            return {str(record.get("model_name")) for record in records}
+        if kind == "groups":
+            names: Final[list[str]] = []
+            for record in records:
+                team: str | None = _team_of(record)
+                if team is None:
+                    names.append(str(record.get("model_name")))
+                elif team_id is not None and team == team_id:
+                    public = (as_str_mapping(record.get("model_info")) or {}).get("team_public_model_name")
+                    if isinstance(public, str):
+                        names.append(public)
+            names.extend(alias for alias, target in self._core._resolved.model_group_alias.items() if not _hidden(target))  # pyright: ignore[reportPrivateUsage]  # see above
+            return names
+        raise RustCoreUnsupported(f"registry().names(kind={kind!r}) is not served by the Rust router core")
+
+    def resolve(  # pyright: ignore[reportIncompatibleMethodOverride]  # the served kinds only
+        self, name: str | None, *, kind: str = "group", team_id: str | None = None, **_: object
+    ) -> str | bool | None:
+        aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
+        if kind == "from_id":
+            record: Final = self._core._handle.deployment(str(name))  # pyright: ignore[reportPrivateUsage]  # see above
+            return None if record is None else str((as_str_mapping(record) or {}).get("model_name"))
+        if name is None:
+            raise TypeError(f"registry().resolve(kind={kind!r}) needs a name")
+        if kind == "alias":
+            return _alias_target(aliases.get(name)) if name in aliases else None
+        if kind == "group":
+            resolution: Final = self._core._handle.resolve(name)  # pyright: ignore[reportPrivateUsage]  # see above
+            if resolution is not None:
+                return str(resolution["model_group"])
+            return _alias_target(aliases.get(name)) if name in aliases else name
+        if kind == "recognized":
+            return self._core._handle.resolve(name) is not None  # pyright: ignore[reportPrivateUsage]  # see above
+        raise RustCoreUnsupported(f"registry().resolve(kind={kind!r}) is not served by the Rust router core")
+
+    def aliases(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh dict
+        return dict(self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # see above
+
+    def _target(self, name: str) -> str:
+        aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
+        return _alias_target(aliases.get(name)) or name if name in aliases else name
+
+
+_REGISTRY_SERVED: Final = frozenset(
+    {
+        "version",
+        "deployment",
+        "has_deployment",
+        "deployment_dict",
+        "deployments",
+        "all",
+        "names",
+        "resolve",
+        "aliases",
+        "_records",
+        "_target",
+    }
+)
+
+
+def _team_of(record: Mapping[str, object]) -> str | None:
+    team: Final = (as_str_mapping(record.get("model_info")) or {}).get("team_id")
+    return team if isinstance(team, str) else None
+
+
+def _usable_by(record: Mapping[str, object], team_id: str | None) -> bool:
+    team: Final = _team_of(record)
+    return team is None or team == team_id
+
+
+def _hidden(target: object) -> bool:
+    mapping: Final = as_str_mapping(target)
+    return mapping is not None and mapping.get("hidden") is True
+
+
+def _alias_target(target: object) -> str | None:
+    mapping: Final = as_str_mapping(target)
+    if mapping is not None:
+        model: Final = mapping.get("model")
+        return model if isinstance(model, str) else None
+    return target if isinstance(target, str) else None
+
+
+class RustSettings(RouterSettings):
+    """``settings()``: the resolved settings as a frozen snapshot."""
+
+    def as_dict(self) -> Mapping[str, object]:
+        router: Final = self._router
+        if not isinstance(router, _SettingsSource):
+            return super().as_dict()
+        return router.settings_dict()
+
+
+class _SettingsSource:
+    def settings_dict(self) -> Mapping[str, object]:
+        raise NotImplementedError
+
+
+class RustHealth(RouterHealth):
+    """``health()``: cooldowns, fail counts and usage, read through the host's routing cache and
+    written through the Rust core."""
+
+    __slots__ = ("_core",)
+
+    def __init__(self, core: "RustCore") -> None:  # pyright: ignore[reportMissingSuperCall]  # reads the Rust core, not a Router
+        self._core = core
+
+    def __getattribute__(self, name: str) -> object:
+        if name in _HEALTH_SERVED or name.startswith("__") or name == "_core":
+            return object.__getattribute__(self, name)
+        raise RustCoreUnsupported(f"health().{name} is not served by the Rust router core", name=name, obj=self)
+
+    @property
+    def store(self) -> "DualCache":
+        return self._core._cache  # pyright: ignore[reportPrivateUsage]  # the health view reads its own core
+
+    @property
+    def cooldowns(self) -> "CooldownCache":
+        return self._core._cooldowns  # pyright: ignore[reportPrivateUsage]  # see above
+
+    def failures_this_minute(self, deployment_id: str) -> int:
+        return int(self._core._handle.outcomes_this_minute(deployment_id)[1])  # pyright: ignore[reportPrivateUsage]  # see above
+
+    def record_failure(self, deployment_id: str, exception: Exception, exception_status: str | int) -> bool:
+        failure: Final = dict(attempt_failure(exception))
+        if failure["status"] is None and str(exception_status).isdigit():
+            failure["status"] = int(str(exception_status))
+        done: Final = self._core._drive_sync_steps(self._core._handle.report_failure(deployment_id, failure))  # pyright: ignore[reportPrivateUsage]  # see above
+        return bool(done.get("cooled"))
+
+    async def usage(  # pyright: ignore[reportIncompatibleMethodOverride]  # the same two kinds
+        self, model_group: str, *, kind: Literal["current", "remaining"] = "current"
+    ) -> tuple[int | None, int | None] | Mapping[str, int]:
+        keys: Final = self._core._handle.usage_keys(model_group)  # pyright: ignore[reportPrivateUsage]  # see above
+        if keys is None:
+            if kind == "current":
+                return None, None
+            return {}
+        values: Final = await self.store.async_batch_get_cache(  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
+            keys=[tpm for _, tpm, _ in keys] + [rpm for _, _, rpm in keys]
+        )
+        if kind == "current":
+            tpm_values: Final = (values or [])[: len(keys)]
+            rpm_values: Final = (values or [])[len(keys) :]
+            return _summed(tpm_values), _summed(rpm_values)
+        if kind != "remaining":
+            raise ValueError(f"unknown usage kind {kind!r}")
+        current_tpm, current_rpm = await self.usage(model_group)  # pyright: ignore[reportGeneralTypeIssues]  # the current kind returns a pair
+        limits: Final = [
+            as_str_mapping((as_str_mapping(self._core._handle.deployment(id)) or {}).get("litellm_params")) or {}  # pyright: ignore[reportPrivateUsage]  # see above
+            for id, _, _ in keys
+        ]
+        tpm_limit: Final = _limit(limits, "tpm")
+        rpm_limit: Final = _limit(limits, "rpm")
+        remaining: Final[dict[str, int]] = {}  # mutable-ok: the header map, built here
+        if tpm_limit is not None:
+            remaining["x-ratelimit-remaining-tokens"] = tpm_limit - (current_tpm or 0)
+            remaining["x-ratelimit-limit-tokens"] = tpm_limit
+        if rpm_limit is not None:
+            remaining["x-ratelimit-remaining-requests"] = rpm_limit - (current_rpm or 0)
+            remaining["x-ratelimit-limit-requests"] = rpm_limit
+        return remaining
+
+
+_HEALTH_SERVED: Final = frozenset({"store", "cooldowns", "failures_this_minute", "record_failure", "usage"})
+
+
+def _summed(values: Sequence[object]) -> int | None:
+    numbers: Final = [int(value) for value in values if isinstance(value, int | float)]
+    return sum(numbers) if numbers else None
+
+
+def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
+    values: Final = [int(value) for p in params if isinstance((value := p.get(key)), int | float)]
+    return sum(values) if values else None
+
+
+# --- the core -----------------------------------------------------------------------------------
+
+
+_EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
+
+
+class RustCore(_SettingsSource):
+    """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
+
+    def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
+        from litellm.router_utils.cooldown_cache import CooldownCache
+
         self._config: Final = config
-        self._python: Final = python
         self._host: Final = host
-        self._built_for: tuple[int, int] = self._state()
+        self._resolved: Resolved = resolved
+        self._cache: Final = host.routing_cache(config)
+        self._cooldowns: CooldownCache = CooldownCache(cache=self._cache, default_cooldown_time=resolved.cooldown_time)
+        self._version: int = 1
+        self._retired: bool = False
+        self._settings: RustSettings | None = None
+        self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
 
     @classmethod
-    def build(cls, config: RouterConfig, host: PythonHost, python_class: type[PythonCore] = PythonCore) -> "RustCore":
-        from litellm.rust_bridge._native import RouterCoreHandle, RustBridgeDeclined
+    def build(cls, config: RouterConfig, host: PythonHost) -> "RustCore":
+        from litellm.rust_bridge._native import RustBridgeDeclined
 
         extra: Final = unsupported_arguments(config)
         if extra:
             raise RustBridgeDeclined(f"router arguments not served by the Rust core: {sorted(extra)}")
-        python: Final = python_class(**config.arguments, _host=host)  # pyright: ignore[reportArgumentType]  # the arguments were bound against PythonCore's own signature
-        try:
-            handle: Final = RouterCoreHandle(static_document(config, python), dynamic_document(python))
-        except Exception as declined:
-            # The Python core is built already (its callbacks registered): keep it, don't build another.
-            raise RustCoreDeclined(str(declined), python) from declined
-        return cls(handle, config, python, host)
+        return cls(config, host, Resolved.of(config, host.dynamic()))
 
     def __getattr__(self, name: str) -> object:
-        return getattr(self._python, name)
+        # Only reached for members this class does not define: never forwarded anywhere.
+        raise RustCoreUnsupported(f"'{name}' is not served by the Rust router core", name=name, obj=self)
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if name in _OWN_ATTRIBUTES:
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._python, name, value)
+    # -- building --------------------------------------------------------------------------------
 
-    def __delattr__(self, name: str) -> None:
-        if name in _OWN_ATTRIBUTES:
-            object.__delattr__(self, name)
-            return
-        delattr(self._python, name)
-
-    def _state(self) -> tuple[int, int]:
-        """What the handle was built from: the deployments, and the settings changesets applied."""
-        return (self._python._registry_version, self._python._settings_version)  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-
-    def _current_handle(self) -> "RouterCoreHandle | None":
-        """The Rust handle, rebuilt after a deployment change or an applied changeset; ``None`` while
-        the Rust core cannot serve the router."""
-        if "_core_async_get_available_deployment" in vars(self._python):
-            # `register_plugin` installed a custom strategy, which only the Python core runs.
-            return None
-        if self._state() == self._built_for:
-            return self._handle
+    def _new_handle(self, model_list: Sequence[object]) -> "RouterCoreHandle":
         from litellm.rust_bridge._native import RouterCoreHandle
 
-        if self._handle is not None:
-            self._handle.retire()
-        strategy: Final = self._python.settings().routing_strategy
-        try:
-            if strategy not in (None, "simple-shuffle"):
-                raise ValueError(f"routing_strategy {strategy!r} is not served by the Rust core")
-            self._handle = RouterCoreHandle(static_document(self._config, self._python), dynamic_document(self._python))
-        except Exception as declined:  # noqa: BLE001  # a change the Rust core cannot take keeps the router on Python until the next one
-            verbose_router_logger.info("Router served by the Python core after a change: %s", declined)
-            self._handle = None
-        self._built_for = self._state()
-        return self._handle
+        names: Final = [
+            str(name)
+            for entry in model_list
+            if isinstance(name := (as_str_mapping(entry) or {}).get("model_name"), str)
+        ]
+        return RouterCoreHandle(
+            self._resolved.static_document(model_list), self._resolved.dynamic_document(self._version, names)
+        )
+
+    def _rebuild(self) -> None:
+        """A new Rust core for changed static settings, over the same deployments."""
+        old: Final = self._handle
+        self._handle = self._new_handle(list(old.deployments()))
+        old.retire()
+
+    # -- entry points ----------------------------------------------------------------------------
+
+    def registry(self) -> RustRegistry:
+        return RustRegistry(self)
+
+    def settings(self) -> RustSettings:
+        """A cached snapshot, replaced when a changeset changes a setting."""
+        if self._settings is None:
+            self._settings = self._settings_snapshot()
+        return self._settings
+
+    def _settings_snapshot(self) -> RustSettings:
+        r: Final = self._resolved
+        return RustSettings(
+            routing_strategy=r.routing_strategy,
+            fallbacks=r.fallbacks,
+            context_window_fallbacks=r.context_window_fallbacks,
+            content_policy_fallbacks=r.content_policy_fallbacks,
+            default_litellm_params=dict(r.default_litellm_params),
+            cooldown_time=r.cooldown_time,
+            allowed_fails=r.allowed_fails,
+            allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
+            disable_cooldowns=r.disable_cooldowns,
+            enable_pre_call_checks=False,
+            enable_health_check_routing=False,
+            enable_tag_filtering=False,
+            fallback_access_check=r.fallback_access_check,  # pyright: ignore[reportArgumentType]  # the check as passed
+            fallback_budget_check=r.fallback_budget_check,  # pyright: ignore[reportArgumentType]  # the check as passed
+            cache_responses=False,
+            _router=self,  # pyright: ignore[reportArgumentType]  # the snapshot reads as_dict from this core
+            _unset=frozenset(
+                {
+                    "default_deployment",
+                    "default_max_parallel_requests",
+                    "health_check_ignore_transient_errors",
+                    "background_health_check_model_groups",
+                    "tag_filtering_match_any",
+                    "tag_routing_prefix",
+                    "router_general_settings",
+                    "provider_budget_config",
+                    "provider_default_deployment_ids",
+                    "kubernetes_pod_discovery",
+                    "search_tools",
+                    "guardrail_list",
+                }
+            ),
+        )
+
+    def settings_dict(self) -> Mapping[str, object]:
+        r: Final = self._resolved
+        return {
+            "routing_strategy_args": {},
+            "routing_strategy": r.routing_strategy,
+            "allowed_fails": r.allowed_fails,
+            "cooldown_time": r.cooldown_time,
+            "num_retries": r.num_retries,
+            "timeout": r.timeout,
+            "retry_after": r.retry_after,
+            "fallbacks": r.fallbacks,
+            "context_window_fallbacks": r.context_window_fallbacks,
+            "model_group_alias": dict(r.model_group_alias),
+            "routing_groups": [],
+        }
+
+    def health(self) -> RustHealth:
+        return RustHealth(self)
+
+    def observe(self) -> RoutingObservers:
+        raise RustCoreUnsupported("observe() is not served by the Rust router core yet", name="observe", obj=self)
+
+    def register_plugin(self, plugin: "CustomRoutingStrategyBase") -> None:
+        # Plugins will run through the host's select step; until then a plugin is refused, never
+        # silently served by another core.
+        raise RustCoreUnsupported(
+            f"register_plugin({type(plugin).__name__}) is not served by the Rust router core yet",
+            name="register_plugin",
+            obj=self,
+        )
+
+    def retire(self) -> None:
+        self._retired = True
+        self._handle.retire()
+
+    def apply(self, changes: ChangeSet) -> ApplyResult:
+        if changes.redis_cache is not None or changes.refresh_model_info:
+            raise RustCoreUnsupported("apply(redis_cache / refresh_model_info) is not served by the Rust router core")
+        values: Final = {**changes.assign, **changes.settings}
+        if values:
+            resolved: Final = self._resolved.changed(values)
+            static_changed: Final = bool(_STATIC_SETTINGS & set(values))
+            self._resolved = resolved
+            self._settings = None
+            if "cooldown_time" in values:
+                from litellm.router_utils.cooldown_cache import CooldownCache
+
+                self._cooldowns = CooldownCache(cache=self._cache, default_cooldown_time=resolved.cooldown_time)
+            if static_changed:
+                self._rebuild()
+            else:
+                names: Final = [str(d.get("model_name")) for d in self._handle.deployments()]
+                self._handle.apply({"settings": resolved.dynamic_document(self._version, names)})
+        upserted: Final[list[Deployment | None]] = []  # mutable-ok: filled per upsert
+        deleted: Final[list[Deployment | None]] = []  # mutable-ok: filled per delete
+        if changes.upsert or changes.delete:
+            records: Final = [_plain(_record(deployment)) for deployment in changes.upsert]
+            for record in records:
+                id = str((as_str_mapping((as_str_mapping(record) or {}).get("model_info")) or {}).get("id"))
+                old = self._handle.deployment(id)
+                upserted.append(None if old is None else _deployment(old))
+            upserted_ids: Final = {
+                str((as_str_mapping((as_str_mapping(record) or {}).get("model_info")) or {}).get("id"))
+                for record in records
+            }
+            for id in changes.delete:
+                old = self._handle.deployment(id)
+                deleted.append(None if old is None or id in upserted_ids else _deployment(old))
+            self._handle.apply({"upsert": records, "delete": list(changes.delete)})
+            self._version += 1
+        return ApplyResult(version=self._version, upserted=upserted, deleted=deleted)
+
+    async def select(  # pyright: ignore[reportIncompatibleMethodOverride]  # the RouterCore selection
+        self, model: str, request_kwargs: dict[str, object] | None = None, **_: object  # mutable-ok: the RouterCore signature
+    ) -> Mapping[str, object]:
+        request: Final = request_kwargs or {}
+        call: Final = self._handle.select(model, _plain(_start_fields(request)))
+        step: Mapping[str, object] = {}
+        outcome: object = None
+        while True:
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome
+            match step["kind"]:
+                case "cache":
+                    outcome = await self._answer_cache(step)
+                case "select":
+                    outcome = step["candidates"]
+                case "done":
+                    record: Final = self._handle.deployment(str(step["deployment_id"]))
+                    return as_str_mapping(record) or {}
+                case "failed":
+                    raise self._failure_error(step, model, None)
+                case other:
+                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+    # -- endpoints -------------------------------------------------------------------------------
 
     async def call(self, op: str, request: Mapping[str, object]) -> object:
+        if op in SYNC_OPS:
+            return self._call_sync(op, request)
         if op not in RUST_SERVED_OPS:
-            return await self._python.call(op, request)
+            raise RustCoreUnsupported(f"endpoint {op!r} is not served by the Rust router core yet", name=op, obj=self)
         return await self._drive(op, request)
 
     async def acompletion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        try:
-            bound: Final = _ACOMPLETION.bind(self._python, *args, **kwargs)
-        except TypeError:
-            # The Python core raises the caller's mistake in its own words.
-            return await self._python.acompletion(*args, **kwargs)  # pyright: ignore[reportCallIssue, reportArgumentType, reportUnknownMemberType, reportUnknownVariableType]  # the call is expected to raise
-        return await self._drive("acompletion", _bound_request(bound))
+        return await self.call("acompletion", request_from_call("acompletion", args, kwargs))
 
-    async def aanthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: the endpoint's own keyword payload
-        return await self._drive("aanthropic_messages", kwargs)
+    async def atext_completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("atext_completion", request_from_call("atext_completion", args, kwargs))
 
     async def aembedding(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        try:
-            bound: Final = _AEMBEDDING.bind(self._python, *args, **kwargs)
-        except TypeError:
-            return await self._python.aembedding(*args, **kwargs)  # pyright: ignore[reportCallIssue, reportArgumentType, reportUnknownMemberType]  # the call is expected to raise
-        return await self._drive("aembedding", _bound_request(bound))
+        return await self.call("aembedding", request_from_call("aembedding", args, kwargs))
 
-    async def aresponses(self, **kwargs: object) -> object:  # kwargs-ok: the endpoint's own keyword payload
-        return await self._drive("aresponses", kwargs)
+    async def aresponses(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("aresponses", request_from_call("aresponses", args, kwargs))
 
-    def retire(self) -> None:
-        if self._handle is not None:
-            self._handle.retire()
-        self._python.retire()
+    async def aanthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("aanthropic_messages", kwargs)
+
+    async def aimage_generation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("aimage_generation", request_from_call("aimage_generation", args, kwargs))
+
+    async def atranscription(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("atranscription", request_from_call("atranscription", args, kwargs))
+
+    async def aspeech(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("aspeech", request_from_call("aspeech", args, kwargs))
+
+    async def arerank(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("arerank", request_from_call("arerank", args, kwargs))
+
+    async def amoderation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return await self.call("amoderation", request_from_call("amoderation", args, kwargs))
+
+    def completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return self._call_sync("completion", request_from_call("completion", args, kwargs))
+
+    def text_completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return self._call_sync("text_completion", request_from_call("text_completion", args, kwargs))
+
+    def embedding(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return self._call_sync("embedding", request_from_call("embedding", args, kwargs))
+
+    def image_generation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        return self._call_sync("image_generation", request_from_call("image_generation", args, kwargs))
+
+    # -- driving a call --------------------------------------------------------------------------
+
+    def _start(self, op: str, request: Mapping[str, object]) -> "tuple[RouterCall, Mapping[str, object]]":
+        if self._retired:
+            raise RuntimeError("this router core was retired")
+        unserved: Final = sorted(
+            key for key in request if key in _UNSERVED_REQUEST_KEYS or key.startswith("mock_testing_")
+        )
+        if unserved:
+            raise RustCoreUnsupported(f"request keys not served by the Rust router core yet: {unserved}")
+        model: Final = request.get("model")
+        if not isinstance(model, str):
+            raise TypeError(f"{op}() needs a model name")
+        field: Final = metadata_field(op)
+        if request.get(field) is not None and not isinstance(request.get(field), Mapping):
+            raise TypeError(f"{field} must be a mapping")
+        aliases: Final = self._resolved.model_group_alias
+        prepared: Final = prepare_call(op, request, model if model in aliases else None)
+        return self._handle.start(op, _plain({"model": model, **_start_fields(request)})), prepared
 
     async def _drive(self, op: str, request: Mapping[str, object]) -> object:
-        handle: Final = self._current_handle()
-        if handle is None or runs_on_python(request) or not isinstance(request.get("model"), str):
-            return await self._python.call(op, request)
-        if not hasattr(request.get(_METADATA_FIELDS.get(op, "metadata"), {}), "update"):
-            # `_update_kwargs_before_fallbacks` raises on metadata it cannot update, before any attempt.
-            return await self._python.call(op, request)
-        fields: Final = {
-            **{key: request[key] for key in _REQUEST_FIELDS if request.get(key) is not None},
-            **{name: request[key] for key, name in _RENAMED_REQUEST_FIELDS.items() if request.get(key) is not None},
-        }
-        team_id: Final = request_team_id(request)
-        try:
-            call: Final = handle.start(
-                op, _plain_document({"model": request["model"], **fields, **({"team_id": team_id} if team_id else {})})
+        call, prepared = self._start(op, request)
+        driver: Final = _Driver(self, op, prepared)
+        outcome: object = None
+        while True:
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome against the step it answers
+            driver.take_events(step.get("events"))
+            match step["kind"]:
+                case "attempt":
+                    outcome = await driver.attempt(step)
+                case "sleep":
+                    await self._host.sleep(float(str(step["seconds"])))
+                    outcome = None
+                case "allow_fallback":
+                    outcome = await driver.allow_fallback(str(step["target"]))
+                case "cache":
+                    outcome = await self._answer_cache(step)
+                case "select":
+                    outcome = step["candidates"]
+                case "done":
+                    return await driver.finish_async(step)
+                case "failed":
+                    raise driver.failed(step)
+                case other:
+                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+    def _call_sync(self, op: str, request: Mapping[str, object]) -> object:
+        async_op: Final = SYNC_OPS[op]
+        call, prepared = self._start(async_op, request)
+        driver: Final = _Driver(self, op, prepared)
+        outcome: object = None
+        while True:
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
+            driver.take_events(step.get("events"))
+            match step["kind"]:
+                case "attempt":
+                    outcome = driver.attempt_sync(step)
+                case "sleep":
+                    self._host.sleep_sync(float(str(step["seconds"])))
+                    outcome = None
+                case "allow_fallback":
+                    # The fallback checks are awaited on the async path only, as in the Python router.
+                    outcome = True
+                case "cache":
+                    outcome = self._answer_cache_sync(step)
+                case "select":
+                    outcome = step["candidates"]
+                case "done":
+                    return driver.finish(step)
+                case "failed":
+                    raise driver.failed(step)
+                case other:
+                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+    def _drive_sync_steps(self, call: "RouterCall") -> Mapping[str, object]:
+        """Drive a call whose only steps are cache ops (``report_failure``) to its end."""
+        outcome: object = None
+        while True:
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
+            match step["kind"]:
+                case "cache":
+                    outcome = self._answer_cache_sync(step)
+                case "done":
+                    return step
+                case "failed":
+                    raise RuntimeError(f"router-core ({step.get('error_kind')}): {step.get('error')}")
+                case other:
+                    raise RuntimeError(f"router-core asked for {other!r} while recording an outcome")
+
+    # -- cache steps -----------------------------------------------------------------------------
+
+    def _store_for(self, key: str) -> "DualCache":
+        """Cooldowns live in the cooldown store; every other routing key in the routing cache."""
+        return self._cooldowns.cooldown_store if key.endswith(":cooldown") else self._cache
+
+    async def _answer_cache(self, step: Mapping[str, object]) -> object:
+        key: Final = str(step.get("key"))
+        ttl: Final = _ttl(step)
+        match step.get("op"):
+            case "get":
+                return _plain(await self._store_for(key).async_get_cache(key))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+            case "batch_get":
+                return _plain(
+                    [await self._store_for(str(k)).async_get_cache(str(k)) for k in _as_list(step.get("keys"))]  # pyright: ignore[reportUnknownMemberType]  # see above
+                )
+            case "set":
+                await self._store_for(key).async_set_cache(key, step.get("value"), **({} if ttl is None else {"ttl": ttl}))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
+                return None
+            case "increment":
+                by: Final = _amount(step.get("value"))
+                total: Final = await self._store_for(key).async_increment_cache(key, by, **({} if ttl is None else {"ttl": ttl}))  # pyright: ignore[reportUnknownMemberType]  # see above
+                return total if isinstance(total, int | float) else by
+            case "delete":
+                await self._store_for(key).async_delete_cache(key)
+                return None
+            case other:
+                raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
+
+    def _answer_cache_sync(self, step: Mapping[str, object]) -> object:
+        key: Final = str(step.get("key"))
+        ttl: Final = _ttl(step)
+        match step.get("op"):
+            case "get":
+                return _plain(self._store_for(key).get_cache(key))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+            case "batch_get":
+                return _plain([self._store_for(str(k)).get_cache(str(k)) for k in _as_list(step.get("keys"))])  # pyright: ignore[reportUnknownMemberType]  # see above
+            case "set":
+                self._store_for(key).set_cache(key, step.get("value"), **({} if ttl is None else {"ttl": ttl}))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
+                return None
+            case "increment":
+                by: Final = _amount(step.get("value"))
+                total: Final = self._store_for(key).increment_cache(key, by, **({} if ttl is None else {"ttl": ttl}))  # pyright: ignore[reportUnknownMemberType]  # see above
+                return total if isinstance(total, int | float) else by
+            case "delete":
+                self._store_for(key).delete_cache(key)
+                return None
+            case other:
+                raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
+
+    # -- errors the core raises when no attempt failed ------------------------------------------
+
+    def _failure_error(self, step: Mapping[str, object], model: str, last: BaseException | None) -> BaseException:
+        import litellm.exceptions as litellm_exceptions
+
+        kind: Final = step.get("error_kind")
+        aliases: Final = self._resolved.model_group_alias
+        if kind == "unknown_model":
+            named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
+            return litellm_exceptions.BadRequestError(
+                message=f"You passed in model={named}. {RouterErrors.no_healthy_deployments.value}",
+                model=named,
+                llm_provider="",
             )
-        except ValueError:
-            return await self._python.call(op, request)
-        return await _Driver(call, self._python, op, request).run()
-
-
-# A fallback chain list in the shape the Python core's fallback walk reads it.
-_Chains: TypeAlias = Sequence[Mapping[str, list[str]]] | None
-
-# The request field `_update_kwargs_before_fallbacks` writes the model group into, per op.
-_METADATA_FIELDS: Final = MappingProxyType(
-    {"aanthropic_messages": "litellm_metadata", "aresponses": "litellm_metadata"}
-)
+        if kind == "no_healthy_deployments":
+            group: Final = self.registry().resolve(model)
+            ids: Final = self.registry().names(str(group), kind="ids")
+            active: Final = self._cooldowns.get_active_cooldowns(list(ids), None)  # pyright: ignore[reportArgumentType]  # a list of ids
+            cooling: Final = [id for id, _ in active]
+            min_cooldown: Final = min(
+                (float(str(entry.get("cooldown_time", self._resolved.cooldown_time))) for _, entry in active),
+                default=self._resolved.cooldown_time,
+            )
+            return RouterRateLimitError(
+                model=model,
+                cooldown_time=min_cooldown,
+                enable_pre_call_checks=False,
+                cooldown_list=cooling,
+                model_ids=list(ids),  # pyright: ignore[reportArgumentType]  # a list of ids
+            )
+        if last is not None:
+            return last
+        return RuntimeError(f"router-core ({kind}): {step.get('error')}")
 
 
 def _ttl(step: Mapping[str, object]) -> float | None:
@@ -456,242 +1124,114 @@ def _ttl(step: Mapping[str, object]) -> float | None:
     return ttl if isinstance(ttl, int | float) else None
 
 
-def _store_for(python: PythonCore, key: str) -> "DualCache":
-    """Cooldowns live in the router's cooldown store; every other routing key in its main DualCache."""
-    health: Final = python.health()
-    return health.cooldowns.cooldown_store if key.endswith(":cooldown") else health.store
+def _amount(value: object) -> float | int:
+    return value if isinstance(value, int | float) and not isinstance(value, bool) else 1
 
 
-async def answer_cache_step(python: PythonCore, step: Mapping[str, object]) -> object:
-    """Run one cache op the Rust core asked for against the router's own DualCaches (memory plus Redis)."""
-    key: Final = str(step.get("key"))
-    ttl: Final = _ttl(step)
-    match step.get("op"):
-        case "get":
-            return _plain(await _store_for(python, key).async_get_cache(key))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
-        case "batch_get":
-            keys: Final = [str(k) for k in _as_list(step.get("keys"))]
-            values: Final[list[object]] = [  # mutable-ok: built here, then made plain
-                await _store_for(python, k).async_get_cache(k)  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
-                for k in keys
-            ]
-            return _plain(values)
-        case "set":
-            store: Final = _store_for(python, key)
-            if ttl is None:
-                await store.async_set_cache(key, step.get("value"))  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
-            else:
-                await store.async_set_cache(key, step.get("value"), ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
-            return None
-        case "increment":
-            amount: Final = step.get("value")
-            by: Final = amount if isinstance(amount, int | float) and not isinstance(amount, bool) else 1
-            counter: Final = _store_for(python, key)
-            total: Final = (
-                await counter.async_increment_cache(key, by)  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
-                if ttl is None
-                else await counter.async_increment_cache(key, by, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # DualCache's writes are untyped
-            )
-            return total if isinstance(total, int | float) else by
-        case "delete":
-            await _store_for(python, key).async_delete_cache(key)
-            return None
-        case other:
-            raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
-
-
-@dataclass(slots=True)
-class _Hop:
-    """One target of a fallback walk and what its level ended on."""
-
-    group: str
-    pending: Mapping[str, object] | None
-    error: BaseException | None = None
-    failed: Mapping[str, object] | None = None
-    children: "list[_Hop]" = field(default_factory=list)  # mutable-ok: the fallbacks tried from this target
+def _record(deployment: object) -> object:
+    dump: Final = getattr(deployment, "model_dump", None)
+    return dump(exclude_none=True) if callable(dump) else deployment
 
 
 class _Driver:
-    """Answers the steps one Rust call loop blocks on until it is done.
+    """Answers the attempt and fallback steps of one call, and shapes its result.
 
-    Each attempt runs on the Python core with retries and fallbacks off, so the driver puts back
-    what Python's own retry and fallback layers add to the outcome: the retry stamp on an error
-    whose retry loop ran out, the retry and fallback headers on a response, and the explanation
-    the fallback layer appends to the error it finally raises.
+    Each attempt is one host call against the deployment Rust picked. The driver keeps the error
+    each fallback level ended on: a level that fails raises its own error, whatever its fallbacks
+    raised, as the Python router does.
     """
 
-    def __init__(self, call: "RouterCall", python: PythonCore, op: str, request: Mapping[str, object]) -> None:
-        self._call: Final = call
-        self._python: Final = python
+    def __init__(self, core: RustCore, op: str, request: Mapping[str, object]) -> None:
+        self._core: Final = core
         self._op: Final = op
         self._request: Final = request
         self._last_response: object = None
         self._last_error: BaseException | None = None
-        # The last failure at each fallback level: a level raises its own last error.
-        self._level_errors: Final[dict[int, BaseException]] = {}  # mutable-ok: filled as the call loop runs
-        self._attempted: bool = False
-        self._walk: Final = AttemptedFallbackTargets()
-        # Fallback targets in the order Rust walked them, and the groups an attempt was made in.
-        self._hop_targets: Final[list[str]] = []  # mutable-ok: filled as the call loop runs
-        self._attempted_groups: Final[set[str]] = set()  # mutable-ok: filled as the call loop runs
-        # The walk in order: ("hop", (level, group, order)), ("attempt", level), ("error", (level,
-        # error, request)), ("sleep", None) before each retry, and ("exhausted", group) when a retry
-        # loop ran out.
-        self._timeline: Final[list[tuple[str, object]]] = []  # mutable-ok: filled as the call loop runs
+        self._level_errors: Final[dict[int, BaseException]] = {}  # mutable-ok: filled as the call runs
+        self._hops: Final[list[str]] = []  # mutable-ok: fallback targets the call walked
+        self._served: tuple[str | None, Mapping[str, object]] = (None, MappingProxyType({}))
 
-    async def run(self) -> object:
-        outcome: object = None  # rebind-ok: each step's outcome answers it
-        while True:
-            step = _STEP.validate_python(self._call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome against the step it answers
-            self._take_events(step.get("events"))
-            match step["kind"]:
-                case "attempt":
-                    outcome = await self._attempt(step)
-                case "sleep":
-                    self._timeline.append(("sleep", None))
-                    await self._python._host.sleep(float(str(step["seconds"])))  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-                    outcome = None
-                case "allow_fallback":
-                    outcome = await self._allow_fallback(str(step["target"]))
-                case "cache":
-                    outcome = await answer_cache_step(self._python, step)
-                case "select":
-                    outcome = step["candidates"]
-                case "done":
-                    return self._with_headers(step)
-                case "failed":
-                    primary = self._level_errors.get(0)
-                    if primary is not None:
-                        if self._walks_order_tiers(primary, self._request.get("model")):
-                            # Python's order-tier walk raises what its last fallback raised, as is.
-                            raise await self._walk_error(self._walk_tree(), primary)
-                        await self._fill_unattempted_level()
-                        self._explain(primary)
-                        raise primary
-                    if not self._attempted:
-                        # No deployment was tried (unknown model, nothing healthy): Python raises its own error.
-                        return await self._python.call(self._op, self._request)
-                    raise RuntimeError(f"router-core ({step.get('error_kind')}): {step.get('error')}")
-                case other:
-                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
-
-    def _take_events(self, events: object) -> None:
+    def take_events(self, events: object) -> None:
         for raw_event in _as_list(events):
             event = as_str_mapping(raw_event)
-            if event is not None and event.get("kind") == "fallback":
-                self._timeline.append(("hop", (event.get("level"), event.get("to"), event.get("order"))))
-            if event is None or event.get("kind") != "retries_exhausted":
+            if event is None:
                 continue
-            self._timeline.append(("exhausted", event.get("model_group")))
+            if event.get("kind") == "fallback":
+                self._hops.append(str(event.get("to")))
+            if event.get("kind") != "retries_exhausted":
+                continue
             error: BaseException | None = self._last_error
             # `async_function_with_retries` stamps the error its exhausted retry loop raises.
-            if error is not None and type(error) in self._python._host.dynamic().exception_types:  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
+            if error is not None and type(error) in self._core._host.dynamic().exception_types:  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
                 error.max_retries = event.get("max")  # pyright: ignore[reportAttributeAccessIssue]  # Python's router stamps the same attributes
-                error.num_retries = event.get("attempted")  # pyright: ignore[reportAttributeAccessIssue]  # Python's router stamps the same attributes
+                error.num_retries = event.get("attempted")  # pyright: ignore[reportAttributeAccessIssue]  # same
 
-    def _walks_order_tiers(self, error: BaseException, group: object) -> bool:
-        """`async_function_with_fallbacks_common_utils` hands a group with more than one order level
-        to `run_async_fallback` outside its try, so the walk's own error is raised with no suffix."""
-        import litellm.exceptions as litellm_exceptions
-
-        python: Final = self._python
-        request: Final = self._request
-        if (
-            request.get("disable_fallbacks") is True
-            or not isinstance(group, str)
-            or is_guardrail_intervention(error)  # pyright: ignore[reportArgumentType]  # every attempt error is an Exception
-            or is_bad_request_without_fallback(error, python.fallback_on_unsupported_params)  # pyright: ignore[reportArgumentType]  # every attempt error is an Exception
-            or isinstance(
-                error,
-                litellm_exceptions.ContextWindowExceededError | litellm_exceptions.ContentPolicyViolationError,
-            )
-        ):
-            return False
-        metadata: Final = as_str_mapping(request.get("metadata"))
-        team: Final = metadata.get("user_api_key_team_id") if metadata is not None else None
-        deployments: Final = (
-            python._core_get_model_list(  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-                model_name=group, team_id=team if isinstance(team, str) else None
-            )
-            or ()
+    def _kwargs(self, step: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        deployment: Final = as_str_mapping(step.get("deployment")) or {}
+        resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # see above
+        kwargs: Final = attempt_kwargs(
+            self._op,
+            self._request,
+            deployment,
+            model_group=str(step["model_group"]),
+            default_litellm_params=resolved.default_litellm_params,
+            timeout=resolved.timeout,
         )
-        orders: Final = {
-            order
-            for deployment in deployments
-            if (order := (deployment.get("litellm_params") or {}).get("order")) is not None  # pyright: ignore[reportUnknownMemberType]  # a deployment's untyped litellm_params
-        }
-        return len(orders) > 1
+        name: Final = step.get("model")
+        self._served = (str(name) if name is not None else None, kwargs)
+        return deployment, kwargs
 
-    def _walk_tree(self) -> _Hop:
-        """The fallback walk as Rust ran it: each hop under the level it was tried from."""
-        root: Final = _Hop(str(self._request.get("model")), None)
-        current: Final[dict[int, _Hop]] = {0: root}  # mutable-ok: the newest hop at each level
-        recent: _Hop | None = None  # rebind-ok: the hop whose attempt failed last
-        for kind, value in self._timeline:
-            if kind == "hop" and isinstance(value, tuple):
-                level, group, order = value  # pyright: ignore[reportUnknownVariableType]  # the timeline's tuples are untyped
-                hop = _Hop(str(group), {**self._request, "model": str(group)})  # pyright: ignore[reportUnknownArgumentType]  # the timeline's tuples are untyped
-                if isinstance(order, int):
-                    hop.pending = {**self._request, "model": str(group), "_target_order": order}  # pyright: ignore[reportUnknownArgumentType]  # the timeline's tuples are untyped
-                parent = current.get(level - 1 if isinstance(level, int) else -1)
-                if parent is not None and isinstance(level, int):
-                    parent.children.append(hop)
-                    current[level] = hop
-                recent = None
-            elif kind == "attempt" and isinstance(value, int) and value in current:
-                current[value].pending = None
-            elif kind == "error" and isinstance(value, tuple) and value[0] in current:
-                recent = current[value[0]]
-                recent.error, recent.failed = value[1], value[2]
-            elif kind == "sleep" and recent is not None:
-                recent.pending = recent.failed  # pyright: ignore[reportUnknownMemberType]  # the timeline's tuples are untyped
-            elif kind == "exhausted" and recent is not None and recent.pending is recent.failed:  # pyright: ignore[reportUnknownMemberType]  # the timeline's tuples are untyped
-                recent.pending = None
-        return root
+    def _failed(self, step: Mapping[str, object], deployment: Mapping[str, object], error: BaseException) -> Mapping[str, object]:
+        stamp_attempt_error(error, deployment)
+        self._last_error = error
+        level: Final = step.get("fallback_level")
+        self._level_errors[level if isinstance(level, int) else 0] = error
+        return attempt_failure(error)
 
-    async def _walk_error(self, hop: _Hop, primary: BaseException) -> BaseException:
-        """The error a hop's level raises. Python raises its own error where Rust made no attempt:
-        for a target with no deployment, and for a retry that found no deployment left to try. A
-        group with more than one order level raises its walk's last error instead
-        (`run_async_fallback`), whatever that walk tried."""
-        own: Final = await self._own_error(hop, primary)
-        if not hop.children or not self._walks_order_tiers(own, hop.group):
-            return own
-        last: BaseException = own  # rebind-ok: each fallback tried replaces it
-        for child in hop.children:
-            last = await self._walk_error(child, primary)
-        return last
-
-    async def _own_error(self, hop: _Hop, primary: BaseException) -> BaseException:
-        """The error the hop's own target raised: Python's, replayed, when Rust made no attempt."""
-        if hop.pending is not None:
-            try:
-                await self._python.call(self._op, {**hop.pending, "num_retries": 0, "disable_fallbacks": True})
-            except Exception as error:  # noqa: BLE001  # the error Python's walk would end on
-                return error
-        return hop.error or primary
-
-    async def _fill_unattempted_level(self) -> None:
-        """A first fallback that resolved no deployment made no attempt, so Rust holds no error for
-        it: ask Python, which raises its own no-deployment error without calling a provider."""
-        if 1 in self._level_errors:
-            return
-        target: Final = next((t for t in self._hop_targets if t not in self._attempted_groups), None)
-        if target is None:
-            return
+    async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        deployment, kwargs = self._kwargs(step)
         try:
-            await self._python.call(
-                self._op, {**self._request, "model": target, "num_retries": 0, "disable_fallbacks": True}
-            )
-        except Exception as error:  # noqa: BLE001  # the error is only quoted in the primary error's message
-            self._level_errors[1] = error
+            response: Final = await self._core._host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))(**kwargs)  # pyright: ignore[reportPrivateUsage, reportGeneralTypeIssues]  # an async endpoint
+        except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
+            return self._failed(step, deployment, error)
+        self._last_response = response
+        return {"ok": True, "total_tokens": total_tokens(response)}
 
-    def _with_headers(self, step: Mapping[str, object]) -> object:
-        response: object = self._last_response  # rebind-ok: the response gains its headers in turn
+    def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        deployment, kwargs = self._kwargs(step)
+        try:
+            response: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
+        except Exception as error:  # noqa: BLE001  # see attempt
+            return self._failed(step, deployment, error)
+        if inspect.isawaitable(response):
+            raise TypeError(f"the host's {self._op} endpoint is not synchronous")
+        self._last_response = response
+        return {"ok": True, "total_tokens": total_tokens(response)}
+
+    async def allow_fallback(self, target: str) -> bool:
+        """`_is_fallback_target_authorized`, then `_is_fallback_target_within_budget`."""
+        if target == self._request.get("model"):
+            return True
+        ctx: Final = RoutingContext(self._core)  # pyright: ignore[reportArgumentType]  # the checks read registry() and settings()
+        request: Final = dict(self._request)
+        if not await ctx.fallback_access_allowed(model=target, request_kwargs=request):
+            return False
+        return await ctx.fallback_budget_allowed(model=target, request_kwargs=request)
+
+    def finish(self, step: Mapping[str, object]) -> object:
+        """The response with the router's headers: the deployment id, the model group it was
+        served as, and the retry and fallback counts (``set_response_headers``)."""
+        response: object = prepare_response_for_header_attachment(self._last_response)  # rebind-ok: the response gains its headers in turn
+        if response is None:
+            return self._last_response
+        name, kwargs = self._served
+        additional: Final = ensure_response_additional_headers(response)
+        apply_response_model_id(response, as_str_mapping(kwargs.get(metadata_field(self._op))))
+        additional["x-litellm-model-group"] = name
         retries: Final = step.get("attempted_retries")
         if isinstance(retries, int) and retries > 0:
             max_retries: Final = step.get("max_retries")
-            response = add_retry_headers_to_response(  # rebind-ok: the response gains its headers in turn
+            response = add_retry_headers_to_response(  # rebind-ok: see above
                 response=response,
                 attempted_retries=retries,
                 max_retries=max_retries if isinstance(max_retries, int) else None,
@@ -701,157 +1241,39 @@ class _Driver:
             response=response, attempted_fallbacks=fallbacks if isinstance(fallbacks, int) else 0
         )
 
-    def _explain(self, error: BaseException) -> None:
-        """Append what `async_function_with_fallbacks_common_utils` appends to the error it raises."""
-        python: Final = self._python
-        request: Final = self._request
-        if (
-            request.get("disable_fallbacks") is True
-            or is_guardrail_intervention(error)  # pyright: ignore[reportArgumentType]  # every attempt error is an Exception
-            or is_bad_request_without_fallback(error, python.fallback_on_unsupported_params)  # pyright: ignore[reportArgumentType]  # every attempt error is an Exception
-            or not hasattr(error, "message")
-            or not python._host.dynamic().expose_router_debug_in_errors  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        ):
-            return
-        model_group: Final = request.get("model")
-        model_name: Final = model_group if isinstance(model_group, str) else None
-        try:
-            self._explain_fallbacks(error, model_name)
-        except Exception:  # noqa: BLE001  # Python looks the chains up inside its fallback try: a bad chain means none was attempted
-            error.message += format_fallback_outcome_message(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error Python raises carries the same suffix
-                model_name, None, "", skipped=self._walk.skipped
-            )
+    async def finish_async(self, step: Mapping[str, object]) -> object:
+        response: Final = self.finish(step)
+        name: Final = self._served[0]
+        if name is not None and response is not None:
+            remaining: Final = await self._core.health().usage(name, kind="remaining")
+            if isinstance(remaining, Mapping):
+                apply_remaining_usage_headers(ensure_response_additional_headers(response), remaining)
+        return response
 
-    def _explain_fallbacks(self, error: BaseException, model_name: str | None) -> None:
-        import litellm.exceptions as litellm_exceptions
-
-        python: Final = self._python
-        request: Final = self._request
-        fallbacks: Final[_Chains] = python._core_fallbacks  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType, reportAssignmentType]  # RustCore drives its own PythonCore, whose chains are untyped lists
-        context_window_fallbacks: Final[_Chains] = python._core_context_window_fallbacks  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType, reportAssignmentType]  # RustCore drives its own PythonCore, whose chains are untyped lists
-        content_policy_fallbacks: Final[_Chains] = python._core_content_policy_fallbacks  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportUnknownVariableType, reportAssignmentType]  # RustCore drives its own PythonCore, whose chains are untyped lists
-        lookup_groups: Final = fallback_lookup_groups(request, model_name)
-        context_window: Final = isinstance(error, litellm_exceptions.ContextWindowExceededError)
-        content_policy: Final = isinstance(error, litellm_exceptions.ContentPolicyViolationError)
-        attempted_group: Sequence[object] | None = None  # rebind-ok: set below
-        orders: Final = sorted(
-            {
-                order
-                for deployment in python._core_get_model_list(model_name=model_name) or ()  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-                if (order := (deployment.get("litellm_params") or {}).get("order")) is not None  # pyright: ignore[reportUnknownMemberType]  # a deployment's untyped litellm_params
-            }
-        )
-        if len(orders) > 1 and not (context_window or content_policy):
-            external, generic = (
-                get_fallback_model_group_for_lookup_groups(fallbacks=fallbacks, lookup_groups=lookup_groups)
-                if fallbacks is not None and lookup_groups
-                else (None, None)
+    def failed(self, step: Mapping[str, object]) -> BaseException:
+        model: Final = str(self._request.get("model"))
+        primary: Final = self._level_errors.get(0)
+        if primary is None:
+            return self._core._failure_error(step, model, self._last_error)  # pyright: ignore[reportPrivateUsage]  # see above
+        if self._core._host.dynamic().expose_router_debug_in_errors and hasattr(primary, "message"):  # pyright: ignore[reportPrivateUsage]  # see above
+            fallback_error: Final = self._level_errors.get(1)
+            primary.message += format_fallback_outcome_message(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error carries the router's explanation
+                model, self._hops or None, str(fallback_error) if fallback_error is not None else ""
             )
-            if external is None and generic is not None and fallbacks is not None:
-                external = fallbacks[generic]["*"]  # rebind-ok: the generic chain when no specific one matched
-            combined: Final = [{"model": model_name, "_target_order": o} for o in orders if o > orders[0]] + list(
-                external or ()
-            )
-            if combined:
-                attempted_group = combined  # rebind-ok: settled in the order Python's walk does
-        if attempted_group is None:
-            specific: Final = (
-                context_window_fallbacks if context_window else content_policy_fallbacks if content_policy else None
-            )
-            if (context_window or content_policy) and specific is not None:
-                attempted_group, _ = (  # rebind-ok: settled in the order Python's walk does
-                    get_fallback_model_group_for_lookup_groups(fallbacks=specific, lookup_groups=lookup_groups)
-                )
-                if attempted_group is None:
-                    # Python raises before its generic fallbacks: "No fallback was attempted".
-                    error.message += format_fallback_outcome_message(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error Python raises carries the same suffix
-                        model_name, None, "", skipped=self._walk.skipped
-                    )
-                    return
-            elif context_window:
-                error.message += (  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error Python raises carries the same suffix
-                    f"\nmodel={model_name}. context_window_fallbacks={mask_sensitive_structure(context_window_fallbacks)}."
-                    f" fallbacks={mask_sensitive_structure(fallbacks)}.\n\nSet 'context_window_fallback' -"
-                    " https://docs.litellm.ai/docs/routing#fallbacks"
-                )
-            elif content_policy:
-                error.message += (  # rebind-ok: the error Python raises carries the same suffix
-                    f"\n{format_content_policy_fallback_hint(model_name, content_policy_fallbacks, fallbacks)}"  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above
-                )
-            if attempted_group is None and fallbacks is not None and lookup_groups:
-                attempted_group, generic_index = (  # rebind-ok: settled in the order Python's walk does
-                    get_fallback_model_group_for_lookup_groups(fallbacks=fallbacks, lookup_groups=lookup_groups)
-                )
-                if attempted_group is None and generic_index is not None:
-                    attempted_group = fallbacks[generic_index][  # rebind-ok: settled in the order Python's walk does
-                        "*"
-                    ]
-                if attempted_group is None:
-                    error.message += format_no_fallback_group_message(lookup_groups, fallbacks)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error Python raises carries the same suffix
-                    return
-        detail: Final = (
-            truncate_fallback_error_detail(redact_string(str(self._level_errors.get(1) or error)))
-            if attempted_group
-            else ""
-        )
-        error.message += format_fallback_outcome_message(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the error Python raises carries the same suffix
-            model_name, attempted_group, detail, skipped=self._walk.skipped
-        )
+        return primary
 
-    def _pinned_request(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        """The request as the Python router's own fallback walk would send it, narrowed to the one
-        deployment Rust picked: the name Rust resolved, with every other deployment it resolved to
-        skipped."""
-        deployment_id: Final = str(step["deployment_id"])
-        name: Final = str(step.get("model") or step["model_group"])
-        candidates: Final = step.get("candidate_ids")
-        others: Final = tuple(str(i) for i in _as_list(candidates) if str(i) != deployment_id)
-        pinned: Final[dict[str, object]] = {  # mutable-ok: built here, then handed to the Python core as its request
-            **self._request,
-            "model": name,
-        }
-        if others:
-            pinned["_retry_skipped_deployment_ids"] = others
-        target_order: Final = step.get("target_order")
-        if isinstance(target_order, int):
-            pinned["_target_order"] = target_order
-        return pinned
 
-    async def _attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        self._attempted = True
-        self._attempted_groups.add(str(step["model_group"]))
-        self._timeline.append(("attempt", step.get("fallback_level")))
-        request: Final = self._pinned_request(step)
-        try:
-            response: Final = await self._python.call(
-                self._op, {**request, "num_retries": 0, "disable_fallbacks": True}
-            )
-        except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
-            self._last_error = error
-            level: Final = step.get("fallback_level")
-            self._level_errors[level if isinstance(level, int) else 0] = error
-            self._timeline.append(("error", (level if isinstance(level, int) else 0, error, request)))
-            return attempt_failure(error)
-        self._last_response = response
-        return {"ok": True, "total_tokens": total_tokens(response)}
+__all__ = [
+    "RUST_SERVED_OPS",
+    "Resolved",
+    "RustCore",
+    "RustCoreUnsupported",
+    "RustHealth",
+    "RustRegistry",
+    "RustSettings",
+    "attempt_failure",
+    "failure_kind",
+    "total_tokens",
+    "unsupported_arguments",
+]
 
-    async def _allow_fallback(self, target: str) -> bool:
-        """`_is_fallback_target_authorized` then `_is_fallback_target_within_budget`."""
-        ctx: Final = self._python._core_ctx  # pyright: ignore[reportPrivateUsage]  # RustCore drives its own PythonCore
-        settings: Final = ctx.settings()
-        request: Final = dict(self._request)
-        original: Final = self._request.get("model")
-        if target == original:
-            return True
-        if settings.fallback_access_check is not None and not await ctx.fallback_access_allowed(
-            model=target, request_kwargs=request
-        ):
-            self._walk.record_skip(target, FallbackSkipReason.NOT_AUTHORIZED)
-            return False
-        if settings.fallback_budget_check is not None and not await ctx.fallback_budget_allowed(
-            model=target, request_kwargs=request
-        ):
-            self._walk.record_skip(target, FallbackSkipReason.OVER_BUDGET)
-            return False
-        self._hop_targets.append(target)
-        return True

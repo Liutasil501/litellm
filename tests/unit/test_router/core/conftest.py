@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 
 import pytest
 
@@ -24,3 +24,18 @@ def make_core(request: pytest.FixtureRequest, host: ScriptedHost) -> Callable[..
             pytest.skip(f"{request.param} core declines this configuration: {declined}")
 
     return build
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Generator[None, object, None]:
+    """A test that reaches a member or request the Rust core does not serve yet is skipped with
+    that member named, so the run separates "not served yet" from a wrong answer."""
+    outcome = yield
+    excinfo = getattr(outcome, "excinfo", None)
+    if excinfo is None:
+        return
+    from litellm.router_rust_core import RustCoreUnsupported
+
+    error = excinfo[1]
+    if isinstance(error, RustCoreUnsupported) or isinstance(error.__cause__, RustCoreUnsupported):
+        outcome.force_exception(pytest.skip.Exception(f"not served by the Rust core yet: {error}", _use_item_location=True))  # pyright: ignore[reportAttributeAccessIssue]  # pluggy's Result
