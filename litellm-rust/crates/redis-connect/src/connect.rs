@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use litellm_circuit_breaker::{Breaker, Config as BreakerConfig};
-use litellm_config::{RedisAuth, RedisEndpoint, RedisTls, ResolvedRedis};
+use litellm_config::{Expected, RedisAuth, RedisEndpoint, RedisError, RedisTls, ResolvedRedis, parse_seconds};
 use litellm_core_utils::settings::Lookup;
 use litellm_redis_client::{
     ClusterEndpoint, ClusterNode, Credentials, CredentialsProvider, DEFAULT_TIMEOUT, Endpoint,
@@ -112,4 +112,55 @@ fn tls_options(tls: RedisTls) -> TlsOptions {
         verify_certificate: tls.verify_certificate,
         check_hostname: tls.check_hostname,
     }
+}
+
+/// The breaker `RedisCache` builds from `REDIS_CIRCUIT_BREAKER_*`, or none when it is disabled.
+pub fn breaker_config(lookup: &dyn Lookup) -> Result<Option<BreakerConfig>, RedisError> {
+    let enabled = lookup
+        .get("REDIS_CIRCUIT_BREAKER_ENABLED")
+        .is_none_or(|value| value.eq_ignore_ascii_case("true"));
+    if !enabled {
+        return Ok(None);
+    }
+    let defaults = BreakerConfig::default();
+    Ok(Some(BreakerConfig {
+        failure_threshold: environment_value(
+            lookup,
+            "REDIS_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            Expected::Integer,
+            |text| text.parse().ok(),
+        )?
+        .unwrap_or(defaults.failure_threshold),
+        recovery_timeout: environment_value(
+            lookup,
+            "REDIS_CIRCUIT_BREAKER_RECOVERY_TIMEOUT",
+            Expected::Seconds,
+            parse_seconds,
+        )?
+        .unwrap_or(defaults.recovery_timeout),
+        timeout_min_duration: environment_value(
+            lookup,
+            "REDIS_CIRCUIT_BREAKER_TIMEOUT_MIN_DURATION",
+            Expected::Seconds,
+            parse_seconds,
+        )?
+        .unwrap_or(defaults.timeout_min_duration),
+    }))
+}
+
+fn environment_value<T>(
+    lookup: &dyn Lookup,
+    name: &str,
+    expected: Expected,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, RedisError> {
+    lookup
+        .get(name)
+        .map(|value| {
+            parse(&value).ok_or_else(|| RedisError::Invalid {
+                setting: name.to_owned(),
+                expected,
+            })
+        })
+        .transpose()
 }

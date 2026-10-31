@@ -1,0 +1,66 @@
+{
+  "source": "main's RedisCache writes str(value) with EX int(ttl) and reads json.loads then ast.literal_eval (litellm/caching/redis_cache.py set_cache and _get_cache_logic); keys from main's CooldownCache and RouterCacheEnum",
+  "cooldowns": [
+    {
+      "model_id": "dep-a",
+      "cooldown": {
+        "exception_received": "RateLimitError: limited é 'quoted'",
+        "status_code": "429",
+        "timestamp": 1730000000.25,
+        "cooldown_time": 60
+      },
+      "ttl_seconds": 90.5,
+      "key": "deployment:dep-a:cooldown",
+      "redis_ttl_seconds": 90,
+      "str_dict": "{'exception_received': \"RateLimitError: limited é 'quoted'\", 'status_code': '429', 'timestamp': 1730000000.25, 'cooldown_time': 60}",
+      "json": "{\"exception_received\": \"RateLimitError: limited \\u00e9 'quoted'\", \"status_code\": \"429\", \"timestamp\": 1730000000.25, \"cooldown_time\": 60}"
+    },
+    {
+      "model_id": "dep-b",
+      "cooldown": {
+        "exception_received": "Timeout",
+        "status_code": "408",
+        "timestamp": 1730000000.5,
+        "cooldown_time": 0.5
+      },
+      "ttl_seconds": 30.0,
+      "key": "deployment:dep-b:cooldown",
+      "redis_ttl_seconds": 30,
+      "str_dict": "{'exception_received': 'Timeout', 'status_code': '408', 'timestamp': 1730000000.5, 'cooldown_time': 0.5}",
+      "json": "{\"exception_received\": \"Timeout\", \"status_code\": \"408\", \"timestamp\": 1730000000.5, \"cooldown_time\": 0.5}"
+    }
+  ],
+  "allowed_fails": [
+    {
+      "model_id": "dep-a",
+      "suffix": null,
+      "key": "deployment:dep-a:allowed_fails"
+    },
+    {
+      "model_id": "dep-a",
+      "suffix": "",
+      "key": "deployment:dep-a:allowed_fails"
+    },
+    {
+      "model_id": "dep-a",
+      "suffix": "timeout",
+      "key": "deployment:dep-a:allowed_fails:timeout"
+    }
+  ],
+  "usage": [
+    {
+      "deployment_id": "dep",
+      "model": "anthropic/claude-sonnet-5-5",
+      "minute": "12-34",
+      "kind": "tpm",
+      "key": "global_router:dep:anthropic/claude-sonnet-5-5:tpm:12-34"
+    },
+    {
+      "deployment_id": "dep",
+      "model": null,
+      "minute": "09-05",
+      "kind": "rpm",
+      "key": "global_router:dep:None:rpm:09-05"
+    }
+  ]
+}
