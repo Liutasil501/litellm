@@ -2657,6 +2657,7 @@ async def websocket_passthrough_request(
     builtin_provider_route: bool = False,
     model: str | None = None,
     meter: WebSocketSessionMeter | None = None,
+    authorized_model: str | None = None,
 ):
     """
     WebSocket passthrough request handler.
@@ -2673,6 +2674,8 @@ async def websocket_passthrough_request(
         builtin_provider_route: Whether a built-in provider route serves the connection, so its URL names the provider
         model: The model the caller named before connecting, logged on a failure before the setup frame arrives
         meter: Prices the session from the client text frames delivered upstream, for an upstream that reports no usage
+        authorized_model: The model the route checked the key against and sends upstream, so pre-call hooks such as
+            per-model rate limits apply to it
     """
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.proxy_server import proxy_config, proxy_logging_obj
@@ -2781,7 +2784,9 @@ async def websocket_passthrough_request(
     )
 
     ### CALL HOOKS ### - modify incoming data / reject request before calling the model
-    websocket_hook_data: Final = guardrail_request_data_with_streaming(MappingProxyType({}), is_streaming=True)
+    websocket_hook_data: Final = guardrail_request_data_with_streaming(
+        MappingProxyType({} if authorized_model is None else {"model": authorized_model}), is_streaming=True
+    )
     await proxy_logging_obj.pre_call_hook(
         user_api_key_dict=user_api_key_dict,
         data=websocket_hook_data,

@@ -2,7 +2,7 @@
 target URL."""
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 from typing import Final
@@ -70,6 +70,7 @@ class _RelayCall:
     endpoint: str
     accept_websocket: bool
     meter: WebSocketSessionMeter | None = None
+    authorized_model: str | None = None
 
 
 class _FakeRelay:
@@ -87,6 +88,7 @@ class _FakeRelay:
         endpoint: str,
         accept_websocket: bool,
         meter: WebSocketSessionMeter | None = None,
+        authorized_model: str | None = None,
     ) -> None:
         self.calls.append(
             _RelayCall(
@@ -97,6 +99,7 @@ class _FakeRelay:
                 endpoint=endpoint,
                 accept_websocket=accept_websocket,
                 meter=meter,
+                authorized_model=authorized_model,
             )
         )
 
@@ -147,6 +150,7 @@ async def test_deepgram_listen_forwards_query_and_injects_only_provider_auth(pat
             forward_headers=False,
             endpoint=path,
             accept_websocket=False,
+            authorized_model="nova-3",
         )
     ]
     assert websocket.accepts == [None]
@@ -369,6 +373,7 @@ def test_deepgram_listen_authenticates_the_litellm_key_and_relays_to_deepgram(mo
             forward_headers=False,
             endpoint="/deepgram/v1/listen",
             accept_websocket=False,
+            authorized_model="nova-3",
         )
     ]
 
@@ -516,10 +521,40 @@ async def test_deepgram_speak_relays_with_provider_auth_and_meters_the_session(
             endpoint=path,
             accept_websocket=False,
             meter=DeepgramSpeakMeter(target, litellm.model_cost["deepgram/aura"]["input_cost_per_character"]),
+            authorized_model="aura-asteria-en",
         )
     ]
     assert websocket.accepts == [None]
     assert websocket.closed is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("serve", "path", "query", "authorized_model"),
+    [
+        pytest.param(_serve, "/deepgram/v1/listen", "model=nova-3&model=nova-2", "nova-3", id="listen"),
+        pytest.param(
+            _serve_speak,
+            "/deepgram/v1/speak",
+            "model=aura-2-thalia-en&model=aura-asteria-en",
+            "aura-2-thalia-en",
+            id="speak",
+        ),
+    ],
+)
+async def test_deepgram_routes_hand_the_relay_the_first_model_param_as_the_authorized_model(
+    serve: Callable[[_FakeWebSocket], Awaitable[_FakeRelay]],
+    path: str,
+    query: str,
+    authorized_model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DEEPGRAM_API_BASE", raising=False)
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-provider-key")
+
+    relay: Final = await serve(_FakeWebSocket(path, query))
+
+    assert [call.authorized_model for call in relay.calls] == [authorized_model]
 
 
 @pytest.mark.asyncio
