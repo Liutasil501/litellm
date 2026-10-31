@@ -1,12 +1,22 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
 use redis::{
-    Cmd, ConnectionInfo, Pipeline, RedisFuture, RedisResult, Value,
-    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig},
+    AsyncConnectionConfig, Cmd, ConnectionAddr, ConnectionInfo, ErrorKind, Pipeline, RedisError,
+    RedisFuture, RedisResult, ServerErrorKind, Value,
+    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::{ClusterClientBuilder, ClusterConfig},
     cluster_async::ClusterConnection,
     io::tcp::TcpSettings,
+    sentinel::{SentinelClient, SentinelClientBuilder, SentinelServerType},
 };
 
-use crate::{ClusterEndpoint, Timeouts, error::Deployment};
+use crate::{
+    ClusterEndpoint, ConnectError, Credentials, Endpoint, SentinelEndpoint, Timeouts, config::addr,
+    error::Deployment,
+};
 
 // redis-py 5.3.1 redis/asyncio/connection.py: without retry options a connection gets Retry(NoBackoff(), 0)
 const RECONNECT_RETRIES: usize = 0;
@@ -20,17 +30,37 @@ const CLUSTER_RETRY_WAIT_MS: u64 = 250;
 pub(crate) enum Connection {
     Standalone(ConnectionManager),
     Cluster(ClusterConnection),
+    Sentinel(SentinelConnection),
 }
 
 impl Connection {
+    pub(crate) fn new(
+        endpoint: &Endpoint,
+        credentials: &Credentials,
+        timeouts: Timeouts,
+    ) -> Result<Self, ConnectError> {
+        match endpoint {
+            Endpoint::Url { .. } | Endpoint::Host(_) => {
+                Self::standalone(endpoint.connection_info(credentials)?, timeouts)
+            }
+            Endpoint::Cluster(cluster) => Self::cluster(cluster, credentials, timeouts),
+            Endpoint::Sentinel(sentinel) => Ok(Self::Sentinel(SentinelConnection::new(
+                sentinel,
+                credentials,
+                timeouts,
+            )?)),
+        }
+    }
+
     pub(crate) fn deployment(&self) -> Deployment {
         match self {
             Self::Standalone(_) => Deployment::Standalone,
             Self::Cluster(_) => Deployment::Cluster,
+            Self::Sentinel(_) => Deployment::Sentinel,
         }
     }
 
-    pub(crate) fn standalone(info: ConnectionInfo, timeouts: Timeouts) -> RedisResult<Self> {
+    fn standalone(info: ConnectionInfo, timeouts: Timeouts) -> Result<Self, ConnectError> {
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(Some(timeouts.connect))
             .set_response_timeout(Some(timeouts.response))
@@ -39,7 +69,11 @@ impl Connection {
         Ok(Self::Standalone(manager))
     }
 
-    pub(crate) fn cluster(endpoint: &ClusterEndpoint, timeouts: Timeouts) -> RedisResult<Self> {
+    fn cluster(
+        endpoint: &ClusterEndpoint,
+        credentials: &Credentials,
+        timeouts: Timeouts,
+    ) -> Result<Self, ConnectError> {
         let builder = ClusterClientBuilder::new(endpoint.addrs())
             .tcp_settings(TcpSettings::default().set_keepalive(socket2::TcpKeepalive::new()))
             .connection_timeout(timeouts.connect)
@@ -48,11 +82,19 @@ impl Connection {
             .retry_wait_formula(0, 2)
             .min_retry_wait(CLUSTER_RETRY_WAIT_MS)
             .max_retry_wait(CLUSTER_RETRY_WAIT_MS + 1);
-        let builder = match &endpoint.username {
+        let builder = match &endpoint.tls {
+            Some(tls) => builder
+                .tls(tls.mode())
+                .certs(tls.certificates()?)
+                .danger_accept_invalid_hostnames(!tls.check_hostname),
+            None => builder,
+        };
+        let Credentials { username, password } = credentials;
+        let builder = match username {
             Some(username) => builder.username(username.expose()),
             None => builder,
         };
-        let builder = match &endpoint.password {
+        let builder = match password {
             Some(password) => builder.password(password.expose()),
             None => builder,
         };
@@ -72,6 +114,7 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(connection) => connection.req_packed_command(cmd),
             Self::Cluster(connection) => connection.req_packed_command(cmd),
+            Self::Sentinel(connection) => connection.req_packed_command(cmd),
         }
     }
 
@@ -84,6 +127,7 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(connection) => connection.req_packed_commands(pipeline, offset, count),
             Self::Cluster(connection) => connection.req_packed_commands(pipeline, offset, count),
+            Self::Sentinel(connection) => connection.req_packed_commands(pipeline, offset, count),
         }
     }
 
@@ -91,6 +135,195 @@ impl ConnectionLike for Connection {
         match self {
             Self::Standalone(connection) => connection.get_db(),
             Self::Cluster(connection) => connection.get_db(),
+            Self::Sentinel(connection) => connection.get_db(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SentinelConnection(Arc<SentinelState>);
+
+struct SentinelState {
+    discovery: tokio::sync::Mutex<SentinelClient>,
+    current: Mutex<Option<(u64, MultiplexedConnection)>>,
+    endpoint: SentinelEndpoint,
+    credentials: Credentials,
+    config: AsyncConnectionConfig,
+    connect_timeout: Duration,
+}
+
+impl SentinelConnection {
+    fn new(
+        endpoint: &SentinelEndpoint,
+        credentials: &Credentials,
+        timeouts: Timeouts,
+    ) -> Result<Self, ConnectError> {
+        let sentinels = endpoint
+            .sentinels
+            .iter()
+            .map(|node| addr(&node.host, node.port, endpoint.tls.as_ref()));
+        let builder = SentinelClientBuilder::new(
+            sentinels,
+            &endpoint.service_name,
+            SentinelServerType::Master,
+        )?;
+        let builder = match (&endpoint.sentinel_password, &credentials.username) {
+            (Some(password), Some(username)) => builder
+                .set_client_to_sentinel_username(username.expose())
+                .set_client_to_sentinel_password(password.expose()),
+            (Some(password), _) => builder.set_client_to_sentinel_password(password.expose()),
+            (None, _) => builder,
+        };
+        let builder = match &endpoint.tls {
+            Some(tls) => builder
+                .set_client_to_sentinel_tls_mode(tls.mode())
+                .set_client_to_sentinel_certificates(tls.certificates()?),
+            None => builder,
+        };
+        let config = AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(timeouts.connect))
+            .set_response_timeout(Some(timeouts.response));
+        Ok(Self(Arc::new(SentinelState {
+            discovery: tokio::sync::Mutex::new(builder.build()?),
+            current: Mutex::new(None),
+            endpoint: endpoint.clone(),
+            credentials: credentials.clone(),
+            config,
+            connect_timeout: timeouts.connect,
+        })))
+    }
+
+    fn cached(&self) -> Option<(u64, MultiplexedConnection)> {
+        self.0
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn connection(&self) -> RedisResult<(u64, MultiplexedConnection)> {
+        if let Some(current) = self.cached() {
+            return Ok(current);
+        }
+        let mut discovery = self.0.discovery.lock().await;
+        if let Some(current) = self.cached() {
+            return Ok(current);
+        }
+        let master = tokio::time::timeout(self.0.connect_timeout, discovery.async_get_client())
+            .await
+            .map_err(|_| timed_out("asking the Sentinels for the master timed out"))??;
+        let connection = self
+            .master_client(master.get_connection_info().addr())?
+            .get_multiplexed_async_connection_with_config(&self.0.config)
+            .await?;
+        let mut current = self
+            .0
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = current.as_ref().map_or(0, |(generation, _)| generation + 1);
+        *current = Some((generation, connection.clone()));
+        Ok((generation, connection))
+    }
+
+    fn master_client(&self, master: &ConnectionAddr) -> Result<redis::Client, RedisError> {
+        let (host, port) = match master {
+            ConnectionAddr::Tcp(host, port) | ConnectionAddr::TcpTls { host, port, .. } => {
+                (host.as_str(), *port)
+            }
+            _ => {
+                return Err(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "Sentinel named a master that is not a TCP address",
+                )));
+            }
+        };
+        let endpoint = Endpoint::Host(crate::HostEndpoint {
+            host: host.to_owned(),
+            port,
+            tls: self.0.endpoint.tls.clone(),
+            db: self.0.endpoint.db,
+        });
+        let info = endpoint
+            .connection_info(&self.0.credentials)
+            .map_err(|error| match error {
+                ConnectError::Redis(error) => error,
+                ConnectError::TlsFile { path, .. } => RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "reading a Redis TLS file",
+                    path,
+                )),
+            })?;
+        redis::Client::open(info)
+    }
+
+    fn forget(&self, generation: u64) {
+        let mut current = self
+            .0
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == generation)
+        {
+            *current = None;
+        }
+    }
+}
+
+fn timed_out(message: &'static str) -> RedisError {
+    RedisError::from(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+}
+
+fn needs_rediscovery(error: &RedisError) -> bool {
+    matches!(
+        crate::Error::classify(error.clone(), Deployment::Sentinel),
+        crate::Error::Transport(_)
+    )
+}
+
+fn replied_read_only(values: &[Value]) -> bool {
+    values.iter().any(|value| {
+        matches!(value, Value::ServerError(error) if error.kind() == Some(ServerErrorKind::ReadOnly))
+    })
+}
+
+impl ConnectionLike for SentinelConnection {
+    fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+        Box::pin(async move {
+            let (generation, mut connection) = self.connection().await?;
+            let reply = connection.req_packed_command(cmd).await;
+            if reply.as_ref().is_err_and(needs_rediscovery) {
+                self.forget(generation);
+            }
+            reply
+        })
+    }
+
+    fn req_packed_commands<'a>(
+        &'a mut self,
+        pipeline: &'a Pipeline,
+        offset: usize,
+        count: usize,
+    ) -> RedisFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let (generation, mut connection) = self.connection().await?;
+            let replies = connection
+                .req_packed_commands(pipeline, offset, count)
+                .await;
+            let rediscover = match &replies {
+                Ok(values) => replied_read_only(values),
+                Err(error) => needs_rediscovery(error),
+            };
+            if rediscover {
+                self.forget(generation);
+            }
+            replies
+        })
+    }
+
+    fn get_db(&self) -> i64 {
+        self.0.endpoint.db
     }
 }

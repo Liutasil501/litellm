@@ -100,7 +100,9 @@ impl Pipeline {
     fn groups(&self, connection: &Connection) -> Vec<Vec<usize>> {
         match connection {
             _ if self.ops.is_empty() => Vec::new(),
-            Connection::Standalone(_) => vec![(0..self.ops.len()).collect()],
+            Connection::Standalone(_) | Connection::Sentinel(_) => {
+                vec![(0..self.ops.len()).collect()]
+            }
             Connection::Cluster(_) => {
                 let mut by_slot: HashMap<Slot, Vec<usize>> = HashMap::new();
                 for (index, op) in self.ops.iter().enumerate() {

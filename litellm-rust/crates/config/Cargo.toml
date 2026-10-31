@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 litellm-secret-value.workspace = true
+litellm-core-utils.workspace = true
 litellm-router-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -14,6 +15,7 @@ serde_yaml_ng = "0.10.0"
 strum.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+veil.workspace = true
 
 [dev-dependencies]
 litellm-error.workspace = true

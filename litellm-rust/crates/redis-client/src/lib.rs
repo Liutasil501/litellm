@@ -11,7 +11,8 @@ mod script;
 pub use client::{RedisClient, Ttl};
 pub use commands::Expiry;
 pub use config::{
-    ClusterEndpoint, ClusterNode, DEFAULT_TIMEOUT, Endpoint, HostEndpoint, RedisConfig, Timeouts,
+    ClusterEndpoint, ClusterNode, Credentials, DEFAULT_TIMEOUT, Endpoint, HostEndpoint,
+    RedisConfig, SentinelEndpoint, Timeouts, TlsOptions,
 };
 pub use error::{ConnectError, Error};
 pub use events::{CallEvent, FailureKind, Operation, Outcome, RedisEvents};
