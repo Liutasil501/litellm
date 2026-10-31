@@ -218,6 +218,8 @@ pub(crate) enum Finish {
         deployment_id: String,
         model_group: String,
     },
+    /// `healthy`: the deployments a pick would choose among.
+    Healthy { deployment_ids: Vec<String> },
     /// `report_failure`: whether the deployment was cooled down.
     Reported { cooled: bool },
 }

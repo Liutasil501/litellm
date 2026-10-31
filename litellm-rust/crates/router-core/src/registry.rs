@@ -293,20 +293,20 @@ impl Registry {
         self.version
     }
 
-    /// The next registry: deletes, then upserts. An upserted deployment whose id exists is
-    /// removed and appended at the end, as the Python router does on an edit.
+    /// The next registry: upserts, then deletes (`apply_changes`). An upserted deployment whose
+    /// id exists is removed and appended at the end, as the Python router does on an edit.
     pub fn apply(
         &self,
         changes: &ChangeSet,
         aliases: Option<BTreeMap<String, String>>,
     ) -> Result<Self, ConfigError> {
         let mut deployments = self.deployments.clone();
-        deployments.retain(|deployment| !changes.deletes.contains(&deployment.id));
         for spec in &changes.upserts {
             let deployment = Deployment::from_spec(spec.clone())?;
             deployments.retain(|existing| existing.id != deployment.id);
             deployments.push(Arc::new(deployment));
         }
+        deployments.retain(|deployment| !changes.deletes.contains(&deployment.id));
         Ok(Self::index(
             self.version + 1,
             deployments,

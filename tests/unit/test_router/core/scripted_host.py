@@ -474,6 +474,14 @@ def rust_core(host: ScriptedHost, **arguments: object) -> RouterCore:  # kwargs-
 
 
 CORE_BUILDERS: Final[dict[str, CoreBuilder]] = {"python": python_core, "rust": rust_core}
+
+
+def records_outcomes_through_callbacks(core: RouterCore) -> bool:
+    """Whether ``core`` learns attempt outcomes from callbacks it registers on its host. The Python
+    core does; the Rust core records every outcome from the attempt itself and registers none."""
+    return isinstance(core, PythonCore)
+
+
 """Every core the suite runs on. Another core adds its builder here; a builder that cannot take a
 configuration raises ``CoreDeclined``, and the test is skipped for that core."""
 

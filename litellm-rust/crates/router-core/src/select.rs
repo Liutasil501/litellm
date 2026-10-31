@@ -168,8 +168,14 @@ impl Core {
             .filter(|d| d.usable_by_team(team_id))
             .collect();
 
-        let ids: Vec<String> = all.iter().map(|d| d.id.clone()).collect();
-        let cooling = self.health.active_cooldowns(&ids).await?;
+        // A deployment named by its id is served even while it cools down
+        // (`get_deployment_by_model_id` returns before the cooldown filter).
+        let cooling = if resolution.kind == ResolveKind::Id {
+            Vec::new()
+        } else {
+            let ids: Vec<String> = all.iter().map(|d| d.id.clone()).collect();
+            self.health.active_cooldowns(&ids).await?
+        };
         let mut healthy: Vec<Arc<Deployment>> = all
             .iter()
             .filter(|d| !cooling.iter().any(|(id, _)| *id == d.id))

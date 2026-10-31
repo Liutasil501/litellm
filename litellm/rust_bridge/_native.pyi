@@ -350,9 +350,16 @@ _FailureKind = Literal[
 class _AttemptStep(TypedDict):
     kind: Literal["attempt"]
     deployment_id: str
+    # The deployment as a `model_list` entry, with its id in `model_info`.
+    deployment: dict[str, JsonValue]
+    # The name this attempt serves: the requested model or the fallback target.
+    model: str
     model_group: str
+    target_order: int | None
+    candidate_ids: list[str]
     retry: int
     fallback_depth: int
+    fallback_level: int
     timeout: float | None
 
 class _SleepStep(TypedDict):
@@ -404,6 +411,22 @@ class _SelectedStep(TypedDict):
     deployment_id: str
     model_group: str
 
+# The end of a `RouterCoreHandle.healthy`.
+class _HealthyStep(TypedDict):
+    kind: Literal["done"]
+    deployment_ids: list[str]
+
+# The end of a `RouterCoreHandle.report_failure`.
+class _ReportedStep(TypedDict):
+    kind: Literal["done"]
+    cooled: bool
+
+# `RouterCoreHandle.resolve`: what a name resolves to.
+class _Resolution(TypedDict):
+    model_group: str
+    kind: str
+    ids: list[str]
+
 _RouterStep = _AttemptStep | _SleepStep | _AllowFallbackStep | _SelectStep | _CacheStep | _DoneStep | _FailedStep
 
 class _AttemptSucceeded(TypedDict):
@@ -427,8 +450,22 @@ class RouterCoreHandle:
     def start(self, op: str, request: _Document) -> RouterCall: ...
     # Driven like `start`; its `done` step is a `_SelectedStep`.
     def select(self, model: str, request: _Document) -> RouterCall: ...
+    # Driven like `select`; its `done` step is a `_HealthyStep`.
+    def healthy(self, model: str, request: _Document) -> RouterCall: ...
+    # `{"upsert": [deployments], "delete": [ids], "settings": {dynamic document}}`.
     def apply(self, changes: _Document) -> int: ...
     def registry_version(self) -> int: ...
+    # A failure the router did not see itself, driven like `start`: cache steps, then a
+    # `_ReportedStep`.
+    def report_failure(self, id: str, failure: _AttemptFailed) -> RouterCall: ...
+    # (successes, failures) recorded for the deployment this minute.
+    def outcomes_this_minute(self, id: str) -> tuple[int, int]: ...
+    # [(id, tpm_key, rpm_key)] for this minute, or None for a group with no deployment.
+    def usage_keys(self, model_group: str) -> list[tuple[str, str, str]] | None: ...
+    # Every deployment as a `model_list` entry, in config order.
+    def deployments(self) -> list[dict[str, JsonValue]]: ...
+    def deployment(self, id: str) -> dict[str, JsonValue] | None: ...
+    def resolve(self, name: str, specific_deployment: bool = False) -> _Resolution | None: ...
     def retire(self) -> None: ...
 
 @final
@@ -438,4 +475,4 @@ class RouterCall:
     # A call from `select` steps through select and cache only, and ends in _SelectedStep or failed.
     def next(
         self, outcome: _AttemptSucceeded | _AttemptFailed | bool | Sequence[str] | JsonValue | None
-    ) -> _RouterStep | _SelectedStep: ...
+    ) -> _RouterStep | _SelectedStep | _HealthyStep | _ReportedStep: ...

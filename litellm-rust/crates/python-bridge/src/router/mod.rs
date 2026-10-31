@@ -136,6 +136,19 @@ impl RouterCoreHandle {
         }))
     }
 
+    /// List the deployments a pick for `model` would choose among, driven like `select`.
+    fn healthy(&self, model: &str, request: &Bound<'_, PyAny>) -> PyResult<RouterCall> {
+        let request =
+            config::request(document(request)?, Some(model)).map_err(config_error_to_pyerr)?;
+        let router = self.router.clone();
+        Ok(RouterCall::new(async move {
+            let deployments = router.healthy(&Op::Completion, &request).await?;
+            Ok(Finish::Healthy {
+                deployment_ids: deployments.iter().map(|d| d.id.clone()).collect(),
+            })
+        }))
+    }
+
     /// Apply `{"upsert": [deployments], "delete": [ids], "settings": {dynamic document}}` and
     /// return the new registry version.
     fn apply(&self, changes: &Bound<'_, PyAny>) -> PyResult<u64> {
@@ -154,7 +167,11 @@ impl RouterCoreHandle {
     fn report_failure(&self, id: &str, failure: &Bound<'_, PyDict>) -> PyResult<RouterCall> {
         let failure = match attempt_outcome(failure)? {
             Err(failure) => failure,
-            Ok(_) => return Err(PyValueError::new_err("a reported failure needs `ok: False`")),
+            Ok(_) => {
+                return Err(PyValueError::new_err(
+                    "a reported failure needs `ok: False`",
+                ));
+            }
         };
         let router = self.router.clone();
         let id = id.to_owned();
@@ -220,7 +237,12 @@ impl RouterCoreHandle {
         specific_deployment: bool,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let registry = self.router.registry();
-        let Some(resolution) = registry.resolve(name, ResolveScope { specific_deployment }) else {
+        let Some(resolution) = registry.resolve(
+            name,
+            ResolveScope {
+                specific_deployment,
+            },
+        ) else {
             return Ok(None);
         };
         let dict = PyDict::new(py);
@@ -506,6 +528,7 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
             dict.set_item("model_group", model_group)
         }
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
+        Finish::Healthy { deployment_ids } => dict.set_item("deployment_ids", deployment_ids),
     }
 }
 

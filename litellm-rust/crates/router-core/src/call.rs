@@ -475,9 +475,9 @@ impl Core {
         match self.host.invoke(&attempt).await {
             Ok(output) => {
                 if let Err(error) = self
-                        .health
-                        .record_success(&deployment, output.total_tokens)
-                        .await
+                    .health
+                    .record_success(&deployment, output.total_tokens)
+                    .await
                 {
                     warn!(deployment_id = %deployment.id, error = %error, "usage was not recorded");
                 }
@@ -517,7 +517,11 @@ impl Core {
             status: failure.status,
         });
         let shape = GroupShape {
-            single_deployment: candidates.all.len() == 1,
+            // The deployment's own group decides, also when the call named the deployment by id.
+            single_deployment: snapshot
+                .registry
+                .group(&deployment.model_name)
+                .map_or(candidates.all.len() == 1, |group| group.len() == 1),
             has_fallback_group: snapshot
                 .settings
                 .dynamic

@@ -7,12 +7,15 @@ here selects, retries, falls back or records cooldowns: the core does all of tha
 reads a Python router either, so this module outlives ``router_python_core.py``.
 """
 
+import re
 import uuid
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final
 
 from litellm.litellm_core_utils.batch_utils import get_router_metadata_variable_name
+from litellm.litellm_core_utils.get_llm_provider_logic import inferred_provider
+from litellm.litellm_core_utils.pattern_match_deployments import PatternMatchRouter
 from litellm.litellm_core_utils.routing_common_utils import without_router_only_kwargs
 
 # Request keys the router reads to route the call; the deployment call never receives them.
@@ -82,6 +85,25 @@ def prepare_call(op: str, request: Mapping[str, object], model_group_alias: str 
     return {**request, "litellm_trace_id": request.get("litellm_trace_id") or str(uuid.uuid4()), field: metadata}
 
 
+def for_requested_model(deployment: Mapping[str, object], requested: str | None) -> Mapping[str, object]:
+    """A wildcard deployment as the router serves ``requested`` through it: its ``model`` with
+    the wildcards filled in from the requested name (``PatternMatchRouter.route``). Any other
+    deployment comes back unchanged."""
+    model_name: Final = deployment.get("model_name")
+    params: Final = _as_mapping(deployment.get("litellm_params"))
+    model: Final = params.get("model")
+    if requested is None or not isinstance(model_name, str) or "*" not in model_name or not isinstance(model, str):
+        return deployment
+    regex: Final = PatternMatchRouter().pattern_to_regex(model_name)
+    match: Final = re.match(regex, requested) or re.match(regex, f"{inferred_provider(requested)}/{requested}")
+    if match is None:
+        return deployment
+    return {
+        **deployment,
+        "litellm_params": {**params, "model": PatternMatchRouter.set_deployment_model_name(match, model)},
+    }
+
+
 def attempt_kwargs(
     op: str,
     request: Mapping[str, object],
@@ -106,10 +128,9 @@ def attempt_kwargs(
             "deployment_model_name": deployment.get("model_name"),
         }
     )
-    tags: Final = params.get("tags")
-    if isinstance(tags, list) and tags:
-        existing: Final = metadata.get("tags")
-        merged: Final = [*existing] if isinstance(existing, list) else []
+    tags: Final = _as_list(params.get("tags"))
+    if tags:
+        merged: Final = list(_as_list(metadata.get("tags")))
         merged.extend(tag for tag in tags if tag not in merged)
         metadata["tags"] = merged
     call: Final = {key: value for key, value in request.items() if key not in ROUTING_KEYS}
@@ -131,18 +152,26 @@ def stamp_attempt_error(error: BaseException, deployment: Mapping[str, object]) 
     params: Final = _as_mapping(deployment.get("litellm_params"))
     if getattr(error, "num_retries", None) is None and params.get("num_retries") is not None:
         try:
-            error.num_retries = int(str(params["num_retries"]))  # pyright: ignore[reportAttributeAccessIssue]  # the router stamps the same attribute
+            error.num_retries = int(str(params["num_retries"]))  # pyright: ignore[reportAttributeAccessIssue]  # the router stamps the same attribute  # rebind-ok: the router stamps the error in place
         except ValueError:
             pass
     deployment_id: Final = _as_mapping(deployment.get("model_info")).get("id")
     if deployment_id and not getattr(error, "failed_deployment_id", None):
         try:
-            error.failed_deployment_id = deployment_id  # pyright: ignore[reportAttributeAccessIssue]  # the router stamps the same attribute
+            error.failed_deployment_id = deployment_id  # pyright: ignore[reportAttributeAccessIssue]  # the router stamps the same attribute  # rebind-ok: see above
         except AttributeError:
             pass
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
-        return {str(key): item for key, item in value.items()}  # pyright: ignore[reportUnknownVariableType]  # a request's untyped mapping
+        entries: Final[Mapping[object, object]] = value  # pyright: ignore[reportUnknownVariableType]  # a request's untyped mapping
+        return {str(key): item for key, item in entries.items()}
     return MappingProxyType({})
+
+
+def _as_list(value: object) -> list[object]:  # mutable-ok: a fresh list
+    if isinstance(value, list):
+        items: Final[list[object]] = value  # pyright: ignore[reportUnknownVariableType]  # a request's untyped list  # mutable-ok: read, then copied
+        return list(items)
+    return []

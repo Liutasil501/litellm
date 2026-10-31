@@ -25,7 +25,7 @@ from litellm.router_config import RouterConfig, RouterDynamicConfig, live_dynami
 if TYPE_CHECKING:
     from pydantic import BaseModel
 
-    from litellm.caching.caching import Cache
+    from litellm.caching.caching import Cache, RedisCache
     from litellm.caching.dual_cache import DualCache
     from litellm.litellm_core_utils.logging_callback_manager import LoggingCallbackManager
     from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
@@ -122,7 +122,7 @@ class PythonHost:
         return litellm.logging_callback_manager
 
     def callback_list(self, name: CallbackList) -> list[object]:  # mutable-ok: the process callback list itself
-        value: Final = getattr(litellm, name)
+        value: Final[object] = getattr(litellm, name)  # pyright: ignore[reportAny]  # an untyped litellm global
         return cast(list[object], value)  # cast-ok: the process callback list is an untyped litellm global
 
     def set_callback_list(self, name: CallbackList, value: list[object]) -> None:  # mutable-ok: assigned as given
@@ -146,7 +146,7 @@ class PythonHost:
         return DualCache(redis_cache=redis_cache_for(config), in_memory_cache=InMemoryCache())
 
 
-def redis_cache_for(config: RouterConfig) -> object:
+def redis_cache_for(config: RouterConfig) -> "RedisCache | None":
     """The Redis cache the router's ``redis_*`` and ``cache_kwargs`` arguments describe, or None."""
     import json
 
@@ -174,9 +174,10 @@ def redis_cache_for(config: RouterConfig) -> object:
         settings.update({str(key): value for key, value in extra.items()})  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # the cache_kwargs argument is untyped
     nodes: object = settings.get("startup_nodes")  # rebind-ok: the env cluster nodes when the arguments name none
     if not nodes:
-        env_nodes: Final = get_secret("REDIS_CLUSTER_NODES")
+        env_nodes: Final[object] = get_secret("REDIS_CLUSTER_NODES")  # pyright: ignore[reportUnknownVariableType]  # get_secret is untyped
         if isinstance(env_nodes, str):
-            nodes = json.loads(env_nodes)  # rebind-ok: see above
+            parsed: Final[object] = json.loads(env_nodes)  # pyright: ignore[reportAny]  # plain JSON
+            nodes = parsed  # rebind-ok: see above
     if nodes:
         return RedisClusterCache(**{**settings, "startup_nodes": nodes})  # pyright: ignore[reportArgumentType]  # RedisCache's keyword arguments
     return RedisCache(**settings)  # pyright: ignore[reportArgumentType]  # RedisCache's keyword arguments

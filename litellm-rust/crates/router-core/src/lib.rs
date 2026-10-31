@@ -264,6 +264,28 @@ impl Router {
         self.core.pick(&snapshot, op, request, &candidates).await
     }
 
+    /// The deployments a pick for `request` would choose among: resolved, team- and
+    /// cooldown-filtered, through the plugins and the lowest `order`.
+    pub async fn healthy(
+        &self,
+        op: &Op,
+        request: &RouterRequest,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        self.live()?;
+        let snapshot = self.core.snapshot.load_full();
+        let candidates = self
+            .core
+            .candidates(
+                &snapshot,
+                op,
+                request,
+                &request.model,
+                &SelectInputs::default(),
+            )
+            .await?;
+        Ok(candidates.healthy)
+    }
+
     pub fn registry(&self) -> Arc<Registry> {
         self.core.snapshot.load().registry.clone()
     }
