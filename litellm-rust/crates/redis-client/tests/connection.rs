@@ -1,16 +1,85 @@
 mod support;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use litellm_redis_testing::ClientConnection;
 use litellm_redis_testing::{RedisDeployment, RedisSentinel, SERVICE_NAME, Topology, eventually};
 use rstest::rstest;
 
 use litellm_redis_client::{
-    ClusterNode, Credentials, Endpoint, Error, Namespace, RedisClient, RedisConfig,
-    SentinelEndpoint, Timeouts,
+    ClusterNode, Credentials, CredentialsProvider, Endpoint, Error, Namespace, RedisClient,
+    RedisConfig, SentinelEndpoint, Timeouts,
 };
 use litellm_secret_value::SecretValue;
-use support::connect_as;
+use support::{Rotating, connect_as, connections};
+
+#[rstest]
+#[tokio::test]
+async fn a_pushed_credential_reauthenticates_the_live_connection_and_a_reconnect_uses_the_latest(
+    #[values(Topology::Standalone, Topology::Cluster)] topology: Topology,
+) {
+    let server = RedisDeployment::start(topology).await.unwrap();
+    server
+        .cli_on_every_node(&[
+            "ACL", "SETUSER", "alice", "on", ">first", "~*", "&*", "+@all",
+        ])
+        .await
+        .unwrap();
+    server
+        .cli_on_every_node(&[
+            "ACL", "SETUSER", "bob", "on", ">second", "~*", "&*", "+@all",
+        ])
+        .await
+        .unwrap();
+    let provider = Arc::new(Rotating::new("alice", "first"));
+    let client = connect_as(
+        &server,
+        Credentials::Provider(CredentialsProvider(provider.clone())),
+    );
+    client.set("k", "1", Duration::from_secs(60)).await.unwrap();
+    let before = connections(&server).await;
+
+    provider.rotate("bob", "second");
+    let rotated = eventually(async || {
+        let now = connections(&server).await;
+        now.iter()
+            .all(|connection| connection.user == "bob")
+            .then_some(now)
+    })
+    .await;
+    server
+        .cli_on_every_node(&["ACL", "DELUSER", "alice"])
+        .await
+        .unwrap();
+    server
+        .cli_on_every_node(&["CLIENT", "KILL", "USER", "bob"])
+        .await
+        .unwrap();
+    let after_reconnect = eventually(async || client.get::<String>("k").await.ok().flatten()).await;
+
+    let reconnected = connections(&server).await;
+
+    assert!(
+        before.iter().all(|connection| connection.user == "alice"),
+        "{before:?}"
+    );
+    assert_eq!(ids(&rotated), ids(&before));
+    assert_eq!(after_reconnect, "1");
+    assert!(!reconnected.is_empty());
+    assert!(
+        reconnected
+            .iter()
+            .all(|connection| connection.user == "bob"),
+        "{reconnected:?}"
+    );
+}
+
+fn ids(connections: &[ClientConnection]) -> Vec<(u16, u64)> {
+    connections
+        .iter()
+        .map(|connection| (connection.node, connection.id))
+        .collect()
+}
 
 #[rstest]
 #[tokio::test]
@@ -22,7 +91,7 @@ async fn a_rejected_credential_is_a_transport_failure() {
         .unwrap();
     let client = connect_as(
         &server,
-        Credentials {
+        Credentials::Static {
             username: None,
             password: Some(SecretValue::new("wrong")),
         },
