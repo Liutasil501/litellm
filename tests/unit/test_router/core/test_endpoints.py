@@ -46,11 +46,16 @@ ENDPOINTS: Final[dict[str, tuple[str, EndpointCall]]] = {
         "anthropic_messages",
         lambda core: core.aanthropic_messages(model="g", messages=MESSAGES, max_tokens=5),
     ),
+    # The proxy's /v1/messages route calls the router by this name (route_request).
+    "anthropic_messages": (
+        "anthropic_messages",
+        lambda core: core.anthropic_messages(model="g", messages=MESSAGES, max_tokens=5),
+    ),
     "call-acompletion": ("acompletion", lambda core: core.call("acompletion", {"model": "g", "messages": MESSAGES})),
     "call-completion": ("completion", lambda core: core.call("completion", {"model": "g", "messages": MESSAGES})),
 }
 SYNC_ENDPOINTS: Final = frozenset({"completion", "embedding", "image_generation"})
-LITELLM_METADATA_ENDPOINTS: Final = frozenset({"aresponses", "aanthropic_messages"})
+LITELLM_METADATA_ENDPOINTS: Final = frozenset({"aresponses", "aanthropic_messages", "anthropic_messages"})
 EMBEDDING_ENDPOINTS: Final = frozenset({"aembedding", "embedding"})
 
 

@@ -1051,6 +1051,10 @@ class RustCore(_SettingsSource):
     async def aanthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
         return await self.call("aanthropic_messages", kwargs)
 
+    async def anthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
+        """The proxy's ``/v1/messages`` route name for ``aanthropic_messages``; async, as in PythonCore."""
+        return await self.call("aanthropic_messages", kwargs)
+
     async def aimage_generation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
         return await self.call("aimage_generation", request_from_call("aimage_generation", args, kwargs))
 
@@ -1383,7 +1387,9 @@ class _Driver:
     def finish(self, step: Mapping[str, object]) -> object:
         """The response with the router's headers: the deployment id, the model group it was
         served as, and the retry and fallback counts (``set_response_headers``)."""
-        response: object = prepare_response_for_header_attachment(self._last_response)  # rebind-ok: gains its headers in turn
+        response: object = prepare_response_for_header_attachment(
+            self._last_response
+        )  # rebind-ok: gains its headers in turn
         if response is None:
             return self._last_response
         name, kwargs = self._served
