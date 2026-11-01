@@ -2,7 +2,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use litellm_config::{RedisSettings, ResolvedRedis, SecretSnapshot};
 use litellm_redis_connect::{Error, HostServices, connect};
-use litellm_redis_testing::{RedisSentinel, RedisServer, RedisTlsServer, SERVICE_NAME, eventually};
+use litellm_redis_testing::{
+    RedisDeployment, RedisSentinel, RedisTlsServer, SERVICE_NAME, Topology, eventually,
+};
 use rstest::rstest;
 
 fn resolved(kwargs: serde_json::Value, environment: &[(&str, &str)]) -> ResolvedRedis {
@@ -64,18 +66,29 @@ async fn static_credentials_from_kwargs_or_environment_authenticate(
     #[case] password: Option<&str>,
     #[case] environment: &[(&str, &str)],
     #[case] connects: bool,
+    #[values(Topology::Standalone, Topology::Cluster)] topology: Topology,
 ) {
-    let server = RedisServer::start().await.unwrap();
+    let server = RedisDeployment::start(topology).await.unwrap();
     server
-        .cli(&["CONFIG", "SET", "requirepass", "right"])
+        .cli_on_every_node(&["ACL", "SETUSER", "default", "on", ">right"])
         .await
         .unwrap();
-    let kwargs = serde_json::json!({
-        "host": "127.0.0.1",
-        "port": port(server.url()),
-        "password": password,
-        "socket_timeout": 2,
-    });
+    let kwargs = match &server {
+        RedisDeployment::Standalone(server) => serde_json::json!({
+            "host": "127.0.0.1",
+            "port": port(server.url()),
+            "password": password,
+            "socket_timeout": 2,
+        }),
+        RedisDeployment::Cluster(cluster) => serde_json::json!({
+            "startup_nodes": cluster.nodes().map(|(host, port)| serde_json::json!({
+                "host": host,
+                "port": port,
+            })).collect::<Vec<_>>(),
+            "password": password,
+            "socket_timeout": 2,
+        }),
+    };
 
     let pinged = connect(resolved(kwargs, environment), services())
         .unwrap()

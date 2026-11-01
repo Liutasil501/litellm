@@ -4,3 +4,5 @@
 - The loop starts on the first `subscribe()`, which redis-rs calls inside its runtime, so `connect` is safe off a runtime
 - A token-only credential (Azure without `REDIS_USERNAME`, GCP) is sent as `AUTH default <token>`, because redis-rs always sends a username with a credentials provider. On Redis 6+ that is the same as Python's `AUTH <token>`
 - Tests for the refresh loop use a fake source and real Redis ACL users. Cloud sources are proven against the live service, unit tests only pin request shapes we own
+- Rotation tests must retain the same server-side connection IDs across re-AUTH, then force a reconnect after removing the old user and verify the new identity still works
+- Live cloud tests live in `tests/live/`. Set `LITELLM_REDIS_AWS_LIVE_CONFIG` or `LITELLM_REDIS_GCP_LIVE_CONFIG` to a JSON file containing `redis` settings and `hold_seconds`. Set the waiting period from the deployment's token lifetime when checking expiry. An unset variable runs no cloud check and is never live proof

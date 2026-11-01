@@ -149,6 +149,7 @@ fn refresh_after(expires_at: Option<SystemTime>, now: SystemTime) -> Duration {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -164,7 +165,7 @@ mod tests {
         ClusterEndpoint, ClusterNode, Credentials, CredentialsProvider, Endpoint, Namespace,
         RedisClient, RedisConfig, Timeouts, TlsOptions,
     };
-    use litellm_redis_testing::{RedisDeployment, Topology, eventually};
+    use litellm_redis_testing::{ClientConnection, RedisDeployment, Topology, eventually};
     use litellm_secret_value::SecretValue;
 
     use super::{CredentialSource, Expiring, RefreshingCredentials, SourceFuture, refresh_after};
@@ -296,18 +297,31 @@ mod tests {
         })
     }
 
+    fn connection_ids(connections: &[ClientConnection]) -> BTreeSet<(u16, u64)> {
+        connections
+            .iter()
+            .map(|connection| (connection.node, connection.id))
+            .collect()
+    }
+
     #[rstest]
     #[tokio::test]
     async fn a_refreshed_token_reauthenticates_live_connections_before_the_old_one_expires(
         #[values(Topology::Standalone, Topology::Cluster)] topology: Topology,
     ) {
         let server = RedisDeployment::start(topology).await.unwrap();
-        for (name, password) in [("alice", ">first"), ("bob", ">second")] {
-            server
-                .cli_on_every_node(&["ACL", "SETUSER", name, "on", password, "~*", "&*", "+@all"])
-                .await
-                .unwrap();
-        }
+        server
+            .cli_on_every_node(&[
+                "ACL", "SETUSER", "alice", "on", ">first", "~*", "&*", "+@all",
+            ])
+            .await
+            .unwrap();
+        server
+            .cli_on_every_node(&[
+                "ACL", "SETUSER", "bob", "on", ">second", "~*", "&*", "+@all",
+            ])
+            .await
+            .unwrap();
         let provider = RefreshingCredentials::new(Scripted {
             replies: Mutex::new(vec![
                 user("alice", "first", Duration::from_secs(2)),
@@ -325,23 +339,15 @@ mod tests {
         })
         .unwrap();
         client.set("k", "1", Duration::from_secs(60)).await.unwrap();
-        let before: Vec<String> = server
-            .clients()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|c| c.user)
-            .collect();
+        let before = server.clients().await.unwrap();
 
         let after = eventually(async || {
-            let users: Vec<String> = server
-                .clients()
-                .await
-                .ok()?
-                .into_iter()
-                .map(|c| c.user)
-                .collect();
-            users.iter().all(|user| user == "bob").then_some(users)
+            let connections = server.clients().await.ok()?;
+            (!connections.is_empty()
+                && connections
+                    .iter()
+                    .all(|connection| connection.user == "bob"))
+            .then_some(connections)
         })
         .await;
         server
@@ -349,11 +355,31 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(before.iter().all(|user| user == "alice"), "{before:?}");
-        assert_eq!(after.len(), before.len());
+        assert!(!before.is_empty());
+        assert!(
+            before.iter().all(|connection| connection.user == "alice"),
+            "{before:?}"
+        );
+        assert_eq!(connection_ids(&after), connection_ids(&before));
         assert_eq!(
             client.get::<String>("k").await.unwrap().as_deref(),
             Some("1")
         );
+        server
+            .cli_on_every_node(&["CLIENT", "KILL", "USER", "bob"])
+            .await
+            .unwrap();
+        let value = eventually(async || client.get::<String>("k").await.ok().flatten()).await;
+        let reconnected = server.clients().await.unwrap();
+
+        assert_eq!(value, "1");
+        assert!(!reconnected.is_empty());
+        assert!(
+            reconnected
+                .iter()
+                .all(|connection| connection.user == "bob"),
+            "{reconnected:?}"
+        );
+        assert!(connection_ids(&reconnected).is_disjoint(&connection_ids(&after)));
     }
 }
